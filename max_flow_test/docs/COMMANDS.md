@@ -24,6 +24,7 @@ Run the StallGuard-based flow test (Auto-SGT → Coarse → Bisection → Verifi
 | `KEEP_SGT` | 0 | `1` = leave the tuned SGT active until next FIRMWARE_RESTART. `0` = restore original after test |
 | `FAN_SPEED` | config `test_fan_speed` (0) | Part-cooling fan speed in % (0–100), locked for the whole test and restored afterwards — fan speed materially changes the achievable max flow |
 | `COLD_EXTRUSION_HINT` | 0 | Flow (mm³/s) you observed as under-extruding; drawn as a marker line in the HTML report. Report-only, the detection ignores it |
+| `MATERIAL` | (blank) | Filament type, e.g. `PLA`, `PETG`, `ABS`. Recorded in the CSV/HTML (the Compare tab checks it). On a Kalico MPC hotend it also sets MPC's filament density / heat capacity for the test — through your `_SET_MPC_MATERIAL` macro if you have one, otherwise from the table in Kalico's MPC docs — and restores the previous values afterwards. Blank = unchanged behaviour |
 | `TEMP` | 0 | Hotend temperature (°C) to heat to and wait for (within 1 °C, via `SET_HEATER_TEMPERATURE` + `TEMPERATURE_WAIT`) before the test. `0` keeps the current target (you heat manually) |
 | `SETTLE` | 20 | Seconds to hold temperature without extruding before each idle heater baseline, so the PID output is steady |
 | `IDLE` | 60 | Seconds of idle heater-duty measurement, taken at the start (after the fan is locked) and again at the end. Feeds the `idle_pwm`, `melt_duty` and `melt_duty_per_flow` CSV columns. Data only, no trigger. `0` disables both baselines |

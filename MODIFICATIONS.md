@@ -91,6 +91,7 @@ up.
 
 | Parameter | Default | Purpose |
 |---|---|---|
+| `MATERIAL` | (blank) | Filament type (`PLA`, `PETG`, `ABS`, …). Recorded in CSV/HTML and checked by the Compare tab. On a Kalico MPC hotend it also sets MPC's filament density / heat capacity for the test (via `_SET_MPC_MATERIAL` if present, else the table from Kalico's MPC docs, i.e. `MPC_SET HEATER=extruder FILAMENT_DENSITY=… FILAMENT_HEAT_CAPACITY=…`) and restores the previous values afterwards, even on abort. Blank = stock behaviour. |
 | `TEMP` | 0 | Heat the hotend and wait to within 1 °C (stock commands, not `M109`, which macro packs often override with a loose window). 0 = use the current target. |
 | `SETTLE` | 20 | Seconds without extrusion before each idle baseline. |
 | `IDLE` | 60 | Seconds of idle heater-duty measurement at the start and end. 0 = off (also disables the melt limit). |
@@ -103,7 +104,7 @@ The `CRYD_FLOW_TEST` macro does not forward these — call
 `TMC_FLOW_FIND_MAX` directly, e.g.
 
 ```
-TMC_FLOW_FIND_MAX START=25 COARSE_STEP=5 MAX=100 TEMP=240 KEEP_SGT=1
+TMC_FLOW_FIND_MAX START=25 COARSE_STEP=5 MAX=100 TEMP=240 MATERIAL=PLA KEEP_SGT=1
 ```
 
 Use `COARSE_STEP=5` and `START` ≥ 25 (enables the two reference steps).
@@ -123,7 +124,8 @@ normal SG curve.
   filament at other temperatures) to overlay heat-vs-line, BDWidth feed
   and StallGuard, with a table of target temp, melt limit and result per
   run. Computed in the browser from the CSVs (older CSVs work too). The
-  CSV that produced the report and files already loaded are rejected.
+  CSV that produced the report and files already loaded are rejected;
+  a different or unrecorded material is flagged.
 - CSV header now also records `result_max_flow` and `result_quality`.
 
 ### Other fixes

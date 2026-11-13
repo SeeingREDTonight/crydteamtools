@@ -2293,7 +2293,7 @@ footer a:hover { text-decoration: underline; }
       <input type="file" id="cmpFile" accept=".csv,text/csv" multiple>
       <div id="cmpMsg" style="margin-top:8px; color: var(--text-tertiary);"></div>
       <table style="margin-top:12px">
-        <thead><tr><th>Run</th><th>Target temp</th><th>Timestamp</th>
+        <thead><tr><th>Run</th><th>Material</th><th>Target temp</th><th>Timestamp</th>
           <th>Melt limit (mm³/s)</th><th>Result (mm³/s)</th><th>Status</th>
           <th></th></tr></thead>
         <tbody id="cmpTable"></tbody>
@@ -3191,6 +3191,10 @@ new Chart(document.getElementById('cvChart'), {
             + ' · ' + (run.meta.timestamp || run.name);
     }
 
+    function matOf(run) {
+        const m = (run.meta.material || '').trim();
+        return (m && m !== 'not specified') ? m : '';
+    }
     function dataset(run, key) {
         return { label: run.label, data: run[key], borderColor: run.color,
                  backgroundColor: run.color, tension: 0, pointRadius: 3,
@@ -3224,6 +3228,7 @@ new Chart(document.getElementById('cvChart'), {
             '<tr><td><span style="display:inline-block;width:10px;height:10px;'
             + 'border-radius:50%%;background:' + r.color + '"></span> '
             + (r.own ? '<b>this report</b>' : r.name) + '</td>'
+            + '<td>' + (matOf(r) || '-') + '</td>'
             + '<td>' + (r.temp !== null ? r.temp.toFixed(0) + ' °C' : '-') + '</td>'
             + '<td>' + (r.meta.timestamp || '-') + '</td>'
             + '<td>' + (r.lastOk !== null ? r.lastOk.toFixed(1) : (r.fitPct.length ? 'above ' + Math.max(...r.fitPct.map(p => p.x)).toFixed(0) : '-')) + '</td>'
@@ -3273,6 +3278,16 @@ new Chart(document.getElementById('cvChart'), {
                     } else {
                         add(f.name, text, false);
                         const run = runs[runs.length - 1];
+                        if (own && matOf(run) && matOf(own)
+                                && matOf(run) !== matOf(own)) {
+                            notes.push(f.name + ': different material ('
+                                       + matOf(run) + ' vs ' + matOf(own)
+                                       + ').');
+                        } else if (own && (!matOf(run) || !matOf(own))) {
+                            notes.push(f.name + ': material not recorded '
+                                       + 'in both runs — check it is the '
+                                       + 'same filament.');
+                        }
                         if (own && run.meta.driver && own.meta.driver
                                 && run.meta.driver !== own.meta.driver) {
                             notes.push(f.name + ': different driver/extruder ('
@@ -3972,6 +3987,95 @@ new Chart(document.getElementById('cvChart'), {
             gcmd.respond_info("Could not restore BDWidth mode (%s) — "
                               "run SET_BDWIDTH NAME=%s COMMAND=%s"
                               % (e, bdw['short'], cmd))
+
+    # ─── MPC filament constants (Kalico) ─────────────────────────
+    # Kalico's MPC feed-forward needs the filament's density and heat
+    # capacity: MPC_SET HEATER=extruder FILAMENT_DENSITY=… 
+    # FILAMENT_HEAT_CAPACITY=…  If the config has the _SET_MPC_MATERIAL
+    # macro from Kalico's MPC docs, that macro (and its table) is used;
+    # otherwise the same table from those docs is built in.
+    MPC_MATERIALS = {
+        'PLA': (1.25, 2.20), 'PETG': (1.27, 2.20), 'PC+ABS': (1.15, 2.20),
+        'ABS': (1.06, 2.40), 'ASA': (1.07, 2.10), 'PA6': (1.12, 2.50),
+        'PA': (1.15, 2.50), 'PC': (1.20, 1.90), 'TPU': (1.21, 2.00),
+        'TPU-90A': (1.15, 2.00), 'TPU-95A': (1.22, 2.00),
+        'ABS-CF': (1.11, 2.40), 'ASA-CF': (1.11, 2.10),
+        'PA6-CF': (1.19, 2.50), 'PC+ABS-CF': (1.22, 2.20),
+        'PC+CF': (1.36, 1.90), 'PLA-CF': (1.29, 2.20),
+        'PETG-CF': (1.30, 2.20),
+    }
+
+    def _mpc_control(self):
+        try:
+            heater = self.printer.lookup_object('extruder').get_heater()
+        except Exception:
+            return None
+        ctrl = getattr(heater, 'control', None)
+        if ctrl is None or not all(hasattr(ctrl, a) for a in (
+                'const_filament_density', 'const_filament_heat_capacity')):
+            return None
+        return ctrl
+
+    def _mpc_apply_material(self, gcmd, material):
+        ctrl = self._mpc_control()
+        if ctrl is None:
+            gcmd.respond_info(
+                "MATERIAL=%s recorded. The hotend is not under MPC "
+                "control, so no heater model was changed." % material)
+            return None
+        orig = (float(ctrl.const_filament_density),
+                float(ctrl.const_filament_heat_capacity))
+        state = {'orig': orig, 'applied': False}
+        macro = self.printer.lookup_object(
+            'gcode_macro _SET_MPC_MATERIAL', None)
+        try:
+            if macro is not None:
+                self.gcode.run_script_from_command(
+                    "_SET_MPC_MATERIAL MATERIAL=%s HEATER=extruder"
+                    % material)
+                source = 'your _SET_MPC_MATERIAL macro'
+            elif material in self.MPC_MATERIALS:
+                d, c = self.MPC_MATERIALS[material]
+                self.gcode.run_script_from_command(
+                    "MPC_SET HEATER=extruder FILAMENT_DENSITY=%.2f "
+                    "FILAMENT_HEAT_CAPACITY=%.2f" % (d, c))
+                source = 'built-in Kalico table'
+            else:
+                gcmd.respond_info(
+                    "MATERIAL=%s is not in the MPC material table — MPC "
+                    "keeps its current filament constants (%.2f / %.2f)."
+                    % (material, orig[0], orig[1]))
+                return state
+        except Exception as e:
+            gcmd.respond_info("Could not set MPC for %s (%s) — MPC "
+                              "unchanged." % (material, e))
+            return state
+        state.update({
+            'applied': True, 'source': source,
+            'density': float(ctrl.const_filament_density),
+            'heat_capacity': float(ctrl.const_filament_heat_capacity)})
+        gcmd.respond_info(
+            "MPC set for %s: density %.2f g/cm³, heat capacity %.2f J/g/K "
+            "(%s). Restored to %.2f / %.2f after the test."
+            % (material, state['density'], state['heat_capacity'],
+               source, orig[0], orig[1]))
+        return state
+
+    def _mpc_restore(self, gcmd, state):
+        if not state.get('applied'):
+            return
+        d, c = state['orig']
+        try:
+            self.gcode.run_script_from_command(
+                "MPC_SET HEATER=extruder FILAMENT_DENSITY=%.4f "
+                "FILAMENT_HEAT_CAPACITY=%.4f" % (d, c))
+            state['applied'] = False
+        except Exception as e:
+            gcmd.respond_info("Could not restore MPC filament constants "
+                              "(%s) — run MPC_SET HEATER=extruder "
+                              "FILAMENT_DENSITY=%.2f "
+                              "FILAMENT_HEAT_CAPACITY=%.2f"
+                              % (e, d, c))
 
     # ─── Generic filament motion sensor (encoder) ─────────────────
     # Klipper's [filament_motion_sensor] (BTT SFS and similar) only
@@ -6808,10 +6912,17 @@ new Chart(document.getElementById('cvChart'), {
     def cmd_TMC_FLOW_FIND_MAX(self, gcmd):
         """Run the StallGuard-based flow test."""
         self._lookup_tmc()
+        self._mpc_state = None
         try:
             self._run_find_max(gcmd)
         except _HardStop:
             pass  # already reported and cleaned up
+        finally:
+            # MATERIAL= changed MPC: never leave it changed, even if the
+            # run aborted before its own cleanup.
+            st = getattr(self, '_mpc_state', None)
+            if st is not None and st.get('applied'):
+                self._mpc_restore(gcmd, st)
 
     def _run_find_max(self, gcmd):
         """Common bracket-bisection algorithm using SG triggers."""
@@ -6861,6 +6972,11 @@ new Chart(document.getElementById('cvChart'), {
         #                 far past the sensor's last pulse; 0 = auto
         #                 (2 × the sensor's detection_length, min 10 mm)
         enc_param = gcmd.get('ENCODER', 'auto').strip()
+        #   MATERIAL=<PLA|PETG|ABS|…>  recorded in the CSV/HTML (the
+        #                 Compare tab checks it) and, on an MPC hotend,
+        #                 used to set MPC's filament density / heat
+        #                 capacity for the test. Blank = unchanged.
+        material = gcmd.get('MATERIAL', '').strip().upper()
         enc_gap = gcmd.get_float('ENCODER_GAP', 0.0, minval=0.)
 
         # Part-cooling fan speed for the test. Defaults to the value
@@ -6891,6 +7007,12 @@ new Chart(document.getElementById('cvChart'), {
             gcmd.respond_info("TMC configuration check passed.")
             for info in infos:
                 gcmd.respond_info(info)
+
+        # ─── Material → MPC filament constants (MATERIAL=) ───
+        mpc_state = None
+        if material:
+            mpc_state = self._mpc_apply_material(gcmd, material)
+            self._mpc_state = mpc_state
 
         # ─── Hotend heat-up (TEMP=) ───
         if test_temp > 0:
@@ -6967,6 +7089,7 @@ new Chart(document.getElementById('cvChart'), {
         sg_label = self._get_sg_label()
         meta = {
             'timestamp': timestamp,
+            'material': material or 'not specified',
             'driver': '%s on %s (%s register, sample rate %.0f Hz)' % (
                 self.driver_type, self.stepper_name, sg_label,
                 1.0 / SAMPLE_INTERVAL),
@@ -7070,6 +7193,13 @@ new Chart(document.getElementById('cvChart'), {
                 meta['idle_pwm_start'] = round(ib['pwm'], 4)
                 meta['idle_temp_start'] = round(ib['temp'], 2)
         t0 = self.reactor.monotonic()
+        if mpc_state is not None and mpc_state.get('applied'):
+            meta['mpc_filament'] = (
+                'density %.2f g/cm³, heat capacity %.2f J/g/K (%s; '
+                'restored to %.2f / %.2f after the test)'
+                % (mpc_state['density'], mpc_state['heat_capacity'],
+                   mpc_state['source'], mpc_state['orig'][0],
+                   mpc_state['orig'][1]))
         meta['idle_settle_s'] = settle_s
         meta['idle_measure_s'] = idle_s
 
@@ -7212,6 +7342,8 @@ new Chart(document.getElementById('cvChart'), {
                 self._bdwidth_restore(gcmd, bdw)
             if enc is not None:
                 self._encoder_restore(gcmd, enc)
+            if mpc_state is not None:
+                self._mpc_restore(gcmd, mpc_state)
             if idle_s <= 0:
                 return
             try:
