@@ -959,7 +959,8 @@ class TMCFlowTest:
                 for n in extra_names)
             data_header = (",t_s,idle_pwm,melt_duty,"
                            "melt_duty_per_flow,melt_fit_pct,"
-                           "bdw_cmd_mm,bdw_meas_mm,bdw_ratio")
+                           "bdw_cmd_mm,bdw_meas_mm,bdw_ratio,"
+                           "enc_gap_mm")
             f.write(base_header + extra_header + data_header + "\n")
 
             # Heat per mm³ vs the fitted low-flow line, in % (only once
@@ -1079,6 +1080,7 @@ class TMCFlowTest:
                     f_or(b.get('cmd_mm'), '%.1f'),
                     f_or(b.get('meas_mm'), '%.1f'),
                     f_or(b.get('ratio'), '%.4f'),
+                    f_or((r.get('enc') or {}).get('gap_mm'), '%.1f'),
                 ]
                 f.write(base_row
                         + ("," + ",".join(extra_cols)
@@ -1459,7 +1461,7 @@ class TMCFlowTest:
                 "<td>%d</td><td%s>%s</td><td>%s</td><td>%s</td>"
                 "<td>%s</td><td>%s</td><td>%s</td>"
                 "<td>%s</td><td>%s</td><td>%s</td><td>%s</td>"
-                "<td>%s</td><td>%s</td><td>%s</td></tr>" % (
+                "<td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
                     fail_style,
                     r.get('phase', ''), r['flow'], fmt(sg, 'median'),
                     fmt(sg, 'p25'), fmt(sg, 'p75'), fmt(sg, 'avg'),
@@ -1475,7 +1477,8 @@ class TMCFlowTest:
                     opt(ex['fit_pct'], '%.0f%%'),
                     opt(ex['bdw_cmd'], '%.0f'),
                     opt(ex['bdw_meas'], '%.0f'),
-                    opt(ex['bdw_pct'], '%.0f%%')))
+                    opt(ex['bdw_pct'], '%.0f%%'),
+                    opt((r.get('enc') or {}).get('gap_mm'), '%.1f')))
 
         table_header = (
             "<th>Phase</th><th>Flow (mm³/s)</th><th>%s median</th>"
@@ -1486,6 +1489,7 @@ class TMCFlowTest:
             "<th>Idle duty</th><th>Melt duty</th><th>Melt / mm³</th>"
             "<th>vs low-flow line</th>"
             "<th>BDW cmd (mm)</th><th>BDW meas (mm)</th><th>BDW feed</th>"
+            "<th>Encoder gap (mm)</th>"
             % (sg_label, sg_label, sg_label, sg_label))
 
         table = ("<table><thead><tr>" + table_header
@@ -3709,6 +3713,94 @@ new Chart(document.getElementById('cvChart'), {
                               "run SET_BDWIDTH NAME=%s COMMAND=%s"
                               % (e, bdw['short'], cmd))
 
+    # ─── Generic filament motion sensor (encoder) ─────────────────
+    # Klipper's [filament_motion_sensor] (BTT SFS and similar) only
+    # pulses every few mm and keeps no counter, but it records where the
+    # extruder was at the last pulse: filament_runout_pos =
+    # extruder position at the last pulse + detection_length. After a
+    # step, "extruder position now − that" is how far the extruder
+    # pushed with no filament movement seen.
+
+    def _resolve_encoder(self, gcmd, param, gap_param):
+        if param.lower() in ('none', 'off', '0'):
+            return None
+        for full_name, o in self.printer.lookup_objects():
+            if not full_name.startswith('filament_motion_sensor'):
+                continue
+            short = full_name.split(None, 1)[-1]
+            if param.lower() != 'auto' and param not in (short, full_name):
+                continue
+            # This test always drives [extruder]; in auto mode ignore
+            # sensors bound to other extruders.
+            if (param.lower() == 'auto'
+                    and getattr(o, 'extruder_name', 'extruder')
+                    not in (None, 'extruder')):
+                continue
+            if not all(hasattr(o, a) for a in (
+                    'filament_runout_pos', 'detection_length',
+                    '_get_extruder_pos')):
+                gcmd.respond_info("Encoder '%s' does not expose its "
+                                  "position (Klipper version?) — skipped."
+                                  % full_name)
+                return None
+            det = float(o.detection_length)
+            limit = gap_param if gap_param > 0 else max(2.0 * det, 10.0)
+            helper = getattr(o, 'runout_helper', None)
+            gcmd.respond_info("Filament motion data: using encoder '%s' "
+                              "(stop when the extruder pushes %.1f mm "
+                              "without a pulse)." % (full_name, limit))
+            return {'obj': o, 'name': full_name, 'short': short,
+                    'detection_length': det, 'gap_limit': limit,
+                    'orig_enabled': getattr(helper, 'sensor_enabled',
+                                            None)}
+        if param.lower() != 'auto':
+            gcmd.respond_info("Encoder '%s' not found — skipped." % param)
+        return None
+
+    def _encoder_prepare(self, gcmd, enc):
+        """Disable the sensor's runout action (pause / runout_gcode)
+        for the test; position tracking keeps running."""
+        if enc['orig_enabled']:
+            try:
+                self.gcode.run_script_from_command(
+                    "SET_FILAMENT_SENSOR SENSOR=%s ENABLE=0" % enc['short'])
+            except Exception:
+                pass
+
+    def _encoder_restore(self, gcmd, enc):
+        if enc['orig_enabled']:
+            try:
+                self.gcode.run_script_from_command(
+                    "SET_FILAMENT_SENSOR SENSOR=%s ENABLE=1" % enc['short'])
+            except Exception as e:
+                gcmd.respond_info("Could not re-enable %s (%s) — run "
+                                  "SET_FILAMENT_SENSOR SENSOR=%s ENABLE=1"
+                                  % (enc['name'], e, enc['short']))
+
+    def _encoder_step(self, enc):
+        o = enc['obj']
+        try:
+            self.gcode.run_script_from_command("M400")
+            now_pos = float(o._get_extruder_pos())
+            last_pulse = float(o.filament_runout_pos) - float(
+                o.detection_length)
+            gap = max(now_pos - last_pulse, 0.0)
+        except Exception:
+            gap = None
+        return {'gap_mm': gap, 'limit_mm': enc['gap_limit']}
+
+    def _check_encoder_feed(self, results):
+        if not results:
+            return None
+        e = results[-1].get('enc') or {}
+        gap = e.get('gap_mm')
+        limit = e.get('limit_mm')
+        if gap is None or not limit or gap <= limit:
+            return None
+        return ("filament motion sensor saw no movement for the last "
+                "%.1f mm of extrusion (limit %.1f mm) — the filament "
+                "stopped moving (stall, slip or clog)" % (gap, limit))
+
     def _bdwidth_total(self, bdw):
         """Wait until the sensor has polled past all motion so far,
         then return its accumulated count."""
@@ -3978,6 +4070,10 @@ new Chart(document.getElementById('cvChart'), {
         if feed_reason:
             self._hard_failure = feed_reason
             return feed_reason
+        enc_reason = self._check_encoder_feed(results)
+        if enc_reason:
+            self._hard_failure = enc_reason
+            return enc_reason
 
         if not results or len(results) < 3:
             return None
@@ -6499,6 +6595,13 @@ new Chart(document.getElementById('cvChart'), {
         #                 (scale-corrected); 0 = record only, no trigger
         self._bdw_min_ratio = gcmd.get_float(
             'BDW_MIN_RATIO', 0.6, minval=0., maxval=0.95)
+        #   ENCODER=<name|auto|none>  Klipper [filament_motion_sensor]
+        #                 (e.g. BTT SFS) used when no bdwidth is found
+        #   ENCODER_GAP=<mm>  fail a step when the extruder advanced this
+        #                 far past the sensor's last pulse; 0 = auto
+        #                 (2 × the sensor's detection_length, min 10 mm)
+        enc_param = gcmd.get('ENCODER', 'auto').strip()
+        enc_gap = gcmd.get_float('ENCODER_GAP', 0.0, minval=0.)
 
         # Part-cooling fan speed for the test. Defaults to the value
         # in [tmc_flow_test] config (or 0 if not set). Override per
@@ -6677,6 +6780,26 @@ new Chart(document.getElementById('cvChart'), {
                                    bdw['sample_time']))
         else:
             meta['bdwidth'] = 'not used'
+        # Generic encoder (Klipper filament_motion_sensor) only when no
+        # bdwidth: bdwidth measures the feed ratio, an encoder can only
+        # tell "the filament stopped".
+        enc = None
+        if bdw is None:
+            enc = self._resolve_encoder(gcmd, enc_param, enc_gap)
+            if enc is not None:
+                self._encoder_prepare(gcmd, enc)
+                meta['motion_sensor'] = (
+                    '%s (filament_motion_sensor, detection_length %.1f mm,'
+                    ' stop when > %.1f mm without a pulse)'
+                    % (enc['name'], enc['detection_length'],
+                       enc['gap_limit']))
+        if bdw is None and enc is None:
+            meta['motion_sensor'] = 'none'
+            gcmd.respond_info(
+                "No filament motion sensor (bdwidth or "
+                "filament_motion_sensor) found — the feed check is "
+                "skipped. Heater collapse still catches stalls and "
+                "strips.")
 
         # ─── Idle heater baseline (start) ───
         # Fan is already locked, so the idle losses match the test.
@@ -6718,6 +6841,14 @@ new Chart(document.getElementById('cvChart'), {
                     gcmd.respond_info(
                         "    BDWidth: %.1f of %.1f mm commanded (%.1f %%)"
                         % (b['meas_mm'], b['cmd_mm'], b['ratio'] * 100))
+            if enc is not None:
+                r['enc'] = self._encoder_step(enc)
+                gap = r['enc'].get('gap_mm')
+                if gap is not None:
+                    gcmd.respond_info(
+                        "    Encoder: last pulse %.1f mm before the end "
+                        "of the step (limit %.1f mm)"
+                        % (gap, enc['gap_limit']))
             return r
 
         def measure_and_save(flow, phase):
@@ -6819,6 +6950,8 @@ new Chart(document.getElementById('cvChart'), {
             BDWidth sensor back in its original mode."""
             if bdw is not None:
                 self._bdwidth_restore(gcmd, bdw)
+            if enc is not None:
+                self._encoder_restore(gcmd, enc)
             if idle_s <= 0:
                 return
             try:

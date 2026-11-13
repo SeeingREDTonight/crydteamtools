@@ -33,7 +33,7 @@ branch, so Moonraker updates come from this fork and branch.
 | Change | Stock behaviour | Modified behaviour |
 |---|---|---|
 | `park_x` / `park_y` options | During a single-axis test the other axis stays wherever homing left it (usually an axis end). | The other axis is moved to `park_x` / `park_y` first (while the tested axis is still at home), then the test runs. Keeps the toolhead clear of obstacles near the ends of travel, e.g. front motor towers on AWD printers. |
-| `skip_resync_gcode` option | After lost steps the test only re-homes. Re-homing does not restore the phase between the two motors of an AWD belt pair, so later steps can run on desynced motors and read low. | After any step that loses steps, the configured G-code (e.g. `SYNC_MOTORS AXES=x,y` from MRX8024/motors-sync, or `MOTOR_SYNC` from this suite) runs at travel speed/accel, then the next step re-homes. Empty = off. |
+| `skip_resync_gcode` option (default `auto`) | After lost steps the test only re-homes. Re-homing does not restore the phase between the two motors of an AWD belt pair, so later steps can run on desynced motors and read low. | After any step that loses steps on a dual-motor axis: accelerometer sync (`SYNC_MOTORS`, MRX8024/motors-sync) if loaded, else StallGuard sync (`MOTOR_SYNC AXIS=…`, this suite's `[motor_sync]`) if enabled, else a console note that the re-sync was skipped and the motors may now be out of sync. Runs at travel speed/accel, then the next step re-homes. Single-motor axes: nothing happens. `none` = off; any other value is run as literal G-code. |
 
 Both options are listed (commented out) in `speed_test_settings.cfg`.
 
@@ -56,6 +56,10 @@ StallGuard. The stock SG triggers are all still active.
 |---|---|---|
 | Heater collapse | Average heater duty drops > 10 % and ≥ 3 points vs the step at the highest lower flow, while flow went up | Filament stopped arriving (stall, strip, clog). Caught every stall/strip in testing; never fired on a clean step. |
 | BDWidth feed | The bdwidth motion counter saw < `BDW_MIN_RATIO` (default 0.6) of the commanded filament, scale-corrected by earlier steps | Needs a bdwidth sensor; auto-detected. Runs from the first reference step, so a jam is caught immediately. Optical tracking depends on the filament surface, so the limit is deliberately coarse. |
+| Encoder feed | Used when no bdwidth is found: a Klipper `[filament_motion_sensor]` (BTT SFS etc.) saw no pulse while the extruder pushed more than `ENCODER_GAP` (default 2 × `detection_length`, min 10 mm) | Auto-detected. Encoders keep no counter, so this is a "filament stopped" check, not a ratio. The sensor's runout action is disabled during the test and restored after. |
+
+With no motion sensor at all, the feed checks are skipped (console note)
+and heater collapse alone catches stalls and strips.
 
 When either fires, the test stops on the spot (bisecting further only
 grinds damaged filament), reports the last step that fed cleanly as the
@@ -81,6 +85,8 @@ up.
 | `IDLE` | 60 | Seconds of idle heater-duty measurement at the start and end. 0 = off (also disables the melt limit). |
 | `BDWIDTH` | auto | bdwidth sensor name, `auto` or `none`. |
 | `BDW_MIN_RATIO` | 0.6 | Feed-check limit; 0 = record only. |
+| `ENCODER` | auto | `[filament_motion_sensor]` name, `auto` or `none` (only used without bdwidth). |
+| `ENCODER_GAP` | 0 (auto) | mm of extrusion without an encoder pulse that counts as "stopped". |
 
 The `CRYD_FLOW_TEST` macro does not forward these — call
 `TMC_FLOW_FIND_MAX` directly, e.g.
@@ -96,7 +102,7 @@ normal SG curve.
 ### Data capture
 
 - New CSV columns: `t_s, idle_pwm, melt_duty, melt_duty_per_flow,
-  melt_fit_pct, bdw_cmd_mm, bdw_meas_mm, bdw_ratio`.
+  melt_fit_pct, bdw_cmd_mm, bdw_meas_mm, bdw_ratio, enc_gap_mm`.
 - New header lines: idle baselines, fit intercept/slope, `melt_limit`,
   bdwidth mode.
 - HTML: new **Melt & feed** tab, full per-step data table with every CSV

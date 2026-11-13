@@ -29,6 +29,8 @@ Run the StallGuard-based flow test (Auto-SGT → Coarse → Bisection → Verifi
 | `IDLE` | 60 | Seconds of idle heater-duty measurement, taken at the start (after the fan is locked) and again at the end. Feeds the `idle_pwm`, `melt_duty` and `melt_duty_per_flow` CSV columns. Data only, no trigger. `0` disables both baselines |
 | `BDWIDTH` | auto | bdwidth sensor (name, `auto`, or `none`) whose motion counter is read before and after every step. Switched to motion-only (and `M221 S100`) for the test, restored at the end. Feeds the `bdw_cmd_mm`, `bdw_meas_mm` and `bdw_ratio` CSV columns. Triggers only through `BDW_MIN_RATIO` |
 | `BDW_MIN_RATIO` | 0.6 | Fail a step when BDWidth saw less than this fraction of the expected filament feed (scale-corrected by the earlier steps' median). Coarse on purpose: the sensor is good for "filament stopped", not for a few percent of slip. `0` = record only |
+| `ENCODER` | auto | Klipper `[filament_motion_sensor]` (e.g. BTT SFS) used for a "filament stopped" check when no bdwidth is found: name, `auto` or `none`. Its runout action is disabled during the test and restored after. Adds the `enc_gap_mm` CSV column |
+| `ENCODER_GAP` | 0 (auto) | Fail a step when the extruder pushed this many mm past the encoder's last pulse. Auto = 2 × the sensor's `detection_length`, at least 10 mm |
 | `NO_HTML` | 0 | Set 1 to skip HTML report |
 | `SKIP_TMC_CHECK` | 0 | Set 1 to bypass config validation |
 
