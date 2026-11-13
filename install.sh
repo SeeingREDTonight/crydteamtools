@@ -403,7 +403,23 @@ if [ -f "${MOONRAKER_CONF}" ]; then
         "^[[:space:]]*\[update_manager[[:space:]]+${UPDATER_NAME}[[:space:]]*\]" \
         "${CONFIG_DIR}" 2>/dev/null; then
         echo ""
-        echo "  • update manager entry already present — skipped"
+        # Keep origin / primary_branch in step with this clone (e.g.
+        # after switching an install to a fork or another branch).
+        entry_files=$(grep -rlEs --include='*.conf' \
+            "^[[:space:]]*\[update_manager[[:space:]]+${UPDATER_NAME}[[:space:]]*\]" \
+            "${CONFIG_DIR}" 2>/dev/null)
+        changed=0
+        for conf in ${entry_files}; do
+            before=$(md5sum "$conf")
+            sed -i -E "/^[[:space:]]*\[update_manager[[:space:]]+${UPDATER_NAME}[[:space:]]*\]/,/^[[:space:]]*\[/{s#^([[:space:]]*origin:).*#\1 ${GIT_ORIGIN}#; s#^([[:space:]]*primary_branch:).*#\1 ${GIT_BRANCH}#}" "$conf"
+            [ "$before" != "$(md5sum "$conf")" ] && changed=1
+        done
+        if [ "$changed" = 1 ]; then
+            echo "  ✓ update manager entry now points to ${GIT_ORIGIN} (${GIT_BRANCH})"
+            echo "    → restart Moonraker once:  sudo systemctl restart moonraker"
+        else
+            echo "  • update manager entry already present — skipped"
+        fi
     else
         cat <<EOF >> "${MOONRAKER_CONF}"
 

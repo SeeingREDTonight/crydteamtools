@@ -72,6 +72,16 @@ StallGuard. The stock SG triggers are all still active.
 With no motion sensor at all, the feed checks are skipped (console note)
 and heater collapse alone catches stalls and strips.
 
+BDWidth is optical, and some filaments track badly: a glossy black PLA
+read 45–71 % of the real feed, jumping ±10 points between steps, while
+it fed normally. So the sensor is judged on the first four steps. If the
+median reading is below 80 %, or two of the four are more than 10 % off
+the median, the feed check and slip start become report-only for that
+run (console note, CSV header `bdwidth_untrusted`) and heater collapse
+alone stops the test. Until those four steps exist, only a jam-level
+reading (under 30 %) stops it, so a jam from the first step is still
+caught at once. The scale correction allows 0.4–1.5 (was 0.8–1.2).
+
 The feed checks also run after every rep inside a step (5 reps by
 default): when one rep already shows the filament stopped, the step ends
 there instead of grinding through the remaining reps. The CSV

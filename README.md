@@ -30,12 +30,34 @@ own README and docs.
 
 ## Installation
 
+This fork lives on the `awd-sync-and-flow-detection` branch:
+
 ```bash
 cd ~
-git clone https://github.com/Fragmon/crydteamtools.git
+git clone -b awd-sync-and-flow-detection https://github.com/SeeingREDTonight/crydteamtools.git
 cd crydteamtools
 bash ./install.sh
 ```
+
+### Switching an existing install from upstream
+
+If `~/crydteamtools` is already a clone of Fragmon's repo:
+
+```bash
+cd ~/crydteamtools
+git remote set-url origin https://github.com/SeeingREDTonight/crydteamtools.git
+git fetch origin
+git checkout -B awd-sync-and-flow-detection origin/awd-sync-and-flow-detection
+bash ./install.sh            # choose "update"
+sudo systemctl restart moonraker
+sudo systemctl restart klipper
+```
+
+Re-running the installer points the existing `[update_manager crydteamtools]`
+entry at this fork and branch, so Mainsail/Fluidd updates come from here.
+Your `*_settings.cfg` files are kept; new options (e.g. `chamber_fans`,
+`park_x`) are documented in the templates in each plugin folder and can be
+copied in by hand.
 
 The installer lets you **pick which plugins to install** (or pass them
 directly: `./install.sh all`, `./install.sh speed_test`,
@@ -52,7 +74,7 @@ directly: `./install.sh all`, `./install.sh speed_test`,
 The only manual step left: open the plugin's settings file (e.g.
 `speed_test_settings.cfg` / `tmc_flow_test_settings.cfg`) in the
 Mainsail/Fluidd config editor, uncomment the section header
-(`[speed_test]` / `[tmc_flow_test]`), then run `FIRMWARE_RESTART`. Every
+(`[speed_test]` / `[tmc_flow_test]`), then run `sudo systemctl restart klipper`. Every
 option is documented in the file with its default value.
 
 Re-running the installer on an existing install asks whether you want to
@@ -86,9 +108,18 @@ Manual alternative:
 
 ```bash
 cd ~/crydteamtools && git pull
+sudo systemctl restart klipper
 ```
 
-Then `FIRMWARE_RESTART`. Re-run `./install.sh` only if new plugins were added.
+Use `sudo systemctl restart klipper`, not `FIRMWARE_RESTART`: a firmware
+restart does not reload the plugins' Python code. Re-run `./install.sh` only
+if new plugins were added.
+
+### Getting upstream changes
+
+This fork does not follow Fragmon's repo automatically. Upstream changes
+are merged into the fork's branch by its maintainer; you then get them with
+the normal update above.
 
 ---
 

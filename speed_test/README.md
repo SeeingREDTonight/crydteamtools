@@ -12,6 +12,24 @@
 
 It pushes a motor until it loses steps, then narrows in on the safe limit with an adaptive bracket search (≈ 8–12 measurements instead of dozens). Skipped steps are detected by reading the stepper's MCU position directly after a re-home. Every run saves a CSV + interactive HTML report.
 
+> **Changes in this fork** (full detail in [MODIFICATIONS.md](../MODIFICATIONS.md)):
+>
+> - **`park_x` / `park_y`** — during a single-axis test the other axis is
+>   parked at this position first, e.g. to keep the toolhead clear of
+>   front motor towers near the ends of travel. Unset = stock behaviour.
+> - **Motor re-sync after lost steps** (`skip_resync_gcode`, default
+>   `auto`) — on a dual-motor (AWD) axis, a step that loses steps can
+>   leave the two motors of a belt out of phase, and re-homing does not
+>   fix that. After such a step the test runs `SYNC_MOTORS`
+>   (accelerometer, MRX8024/motors-sync) if loaded, else `MOTOR_SYNC`
+>   (StallGuard, this suite) if enabled, else prints a note that the
+>   motors may now be out of sync. `none` = off; any other value is run
+>   as your own G-code.
+>
+> Both options are listed (commented out) in `speed_test_settings.cfg`.
+> Existing installs keep their settings file, so copy the lines you
+> want from the template in this folder.
+
 > Looking for the extruder StallGuard flow test? It lives in this repo too: [TMC Flow Test](../max_flow_test/README.md).
 
 ---
@@ -26,7 +44,7 @@ It pushes a motor until it loses steps, then narrows in on the safe limit with a
 
 ```bash
 cd ~
-git clone https://github.com/Fragmon/crydteamtools.git
+git clone -b awd-sync-and-flow-detection https://github.com/SeeingREDTonight/crydteamtools.git
 cd crydteamtools
 ./install.sh speed_test
 ```
@@ -37,7 +55,7 @@ cd crydteamtools
 The installer also drops a fully commented `speed_test_settings.cfg` into
 your config directory and includes it at the top of `printer.cfg`. To
 enable the plugin, open that file, uncomment the `[speed_test]` line, then
-`FIRMWARE_RESTART`. Every option is documented in the file.
+`sudo systemctl restart klipper`. Every option is documented in the file.
 
 ## Minimal config
 

@@ -4910,6 +4910,60 @@ new Chart(document.getElementById('cvChart'), {
                     'last_ok': max(ok) if ok else None})
         return out
 
+    # BDWidth reads optically and some filaments (glossy, translucent)
+    # track badly: a shiny PLA read 45–71 % with ±10-point jumps while
+    # feeding normally. Judged on the first four steps; one outlier is
+    # allowed (a single −25 % dropout has been seen on a good read).
+    BDW_TRUST_STEPS = 4
+    BDW_TRUST_MIN = 0.8      # median feed reading below this → untrusted
+    BDW_TRUST_DEV = 0.10     # a reading this far off the median is off
+    BDW_JAM_LEVEL = 0.3      # median below this = a jam, not a bad read
+    BDW_SCALE_RANGE = (0.4, 1.5)
+
+    def _bdw_reliability(self, results):
+        """None until four steps have BDWidth data; then None if the
+        sensor reads this filament well, else the reason it does not.
+        Readings near zero are a jam, which the feed check must still
+        catch, so they never count as 'unreliable'."""
+        n = self.BDW_TRUST_STEPS
+        first = [r['bdw']['ratio'] for r in results
+                 if (r.get('bdw') or {}).get('ratio') is not None][:n]
+        if len(first) < n:
+            return None
+        srt = sorted(first)
+        med = (srt[n // 2 - 1] + srt[n // 2]) / 2.0
+        if med < self.BDW_JAM_LEVEL:
+            return None
+        off = sum(1 for v in first
+                  if abs(v - med) / med > self.BDW_TRUST_DEV)
+        if med < self.BDW_TRUST_MIN or off >= 2:
+            return ("BDWidth read %s %% of the commanded filament on the "
+                    "first steps (median %.0f %%, %d of %d more than "
+                    "%.0f %% off) — it does not track this filament "
+                    "reliably"
+                    % ("/".join("%.0f" % (v * 100) for v in first),
+                       med * 100, off, n, self.BDW_TRUST_DEV * 100))
+        return None
+
+    def _bdw_limit(self, n_prior):
+        """Feed-check limit for a step with n_prior earlier BDWidth
+        steps. Until the sensor's scale for this filament is known, only
+        a jam-level reading stops the test."""
+        if n_prior < self.BDW_TRUST_STEPS - 1:
+            return min(self.BDW_JAM_LEVEL,
+                       getattr(self, '_bdw_min_ratio', 0.0) or 0.0)
+        return getattr(self, '_bdw_min_ratio', 0.0) or 0.0
+
+    def _bdw_scale(self, ratios):
+        if len(ratios) < 2:
+            return 1.0
+        prior = sorted(ratios)
+        n = len(prior)
+        m = (prior[n // 2] if n % 2
+             else (prior[n // 2 - 1] + prior[n // 2]) / 2.0)
+        lo, hi = self.BDW_SCALE_RANGE
+        return min(max(m, lo), hi)
+
     def _check_bdwidth_feed(self, results):
         """Filament did not move: the BDWidth motion sensor (before the
         extruder) saw far less filament than the step commanded. Catches
@@ -4926,17 +4980,12 @@ new Chart(document.getElementById('cvChart'), {
             return None
         cur = results[-1].get('bdw') or {}
         ratio = cur.get('ratio')
-        if ratio is None:
+        if ratio is None or self._bdw_reliability(results):
             return None
-        prior = sorted(r['bdw']['ratio'] for r in results[:-1]
-                       if (r.get('bdw') or {}).get('ratio') is not None)
-        if len(prior) >= 2:
-            n = len(prior)
-            scale = (prior[n // 2] if n % 2
-                     else (prior[n // 2 - 1] + prior[n // 2]) / 2.0)
-            scale = min(max(scale, 0.8), 1.2)
-        else:
-            scale = 1.0
+        prior = [r['bdw']['ratio'] for r in results[:-1]
+                 if (r.get('bdw') or {}).get('ratio') is not None]
+        scale = self._bdw_scale(prior)
+        min_ratio = self._bdw_limit(len(prior))
         rel = ratio / scale
         if rel >= min_ratio:
             return None
@@ -4961,8 +5010,12 @@ new Chart(document.getElementById('cvChart'), {
                  if (r.get('bdw') or {}).get('ratio') is not None]
         if len(steps) < 3:
             return None
+        why = self._bdw_reliability(results)
+        if why:
+            return {'onset': None, 'untrusted': why}
         first = sorted(v for _, v in steps[:3])
-        scale = min(max(first[1], 0.8), 1.2)
+        lo, hi = self.BDW_SCALE_RANGE
+        scale = min(max(first[1], lo), hi)
         frac = self.SLIP_ONSET_FRAC
         by_flow = sorted((f, v / scale) for f, v in steps)
         onset = None
@@ -7378,17 +7431,9 @@ new Chart(document.getElementById('cvChart'), {
         trigger_events_ref = []   # same list object as trigger_events
 
         def bdw_scale():
-            """Sensor scale for this filament: median feed ratio of the
-            steps so far (clamped 0.8–1.2; 1.0 until two exist)."""
-            prior = sorted(r['bdw']['ratio'] for r in results
-                           if (r.get('bdw') or {}).get('ratio')
-                           is not None)
-            if len(prior) < 2:
-                return 1.0
-            n = len(prior)
-            m = (prior[n // 2] if n % 2
-                 else (prior[n // 2 - 1] + prior[n // 2]) / 2.0)
-            return min(max(m, 0.8), 1.2)
+            return self._bdw_scale(
+                [r['bdw']['ratio'] for r in results
+                 if (r.get('bdw') or {}).get('ratio') is not None])
 
         def measure_annotated(flow, reps):
             """_measure_step plus the data-only extras: time since the
@@ -7404,7 +7449,8 @@ new Chart(document.getElementById('cvChart'), {
                 # period, so that much is taken off the expected length
                 # (errs towards NOT stopping).
                 if bdw is not None and bdw_before is not None \
-                        and min_ratio > 0:
+                        and min_ratio > 0 \
+                        and not self._bdw_reliability(results):
                     try:
                         now = float(bdw['obj'].actual_total_move)
                     except Exception:
@@ -7413,7 +7459,10 @@ new Chart(document.getElementById('cvChart'), {
                     exp = max(cmd - bdw['sample_time'] * mm_s, cmd * 0.5)
                     meas = (now - bdw_before) / bdw['counts_per_mm']
                     rel = meas / exp / bdw_scale()
-                    if rel < min_ratio:
+                    n_prior = sum(1 for x in results
+                                  if (x.get('bdw') or {}).get('ratio')
+                                  is not None)
+                    if rel < self._bdw_limit(n_prior):
                         return ("BDWidth saw %.0f %% of the expected feed "
                                 "after rep %d (%.0f of %.0f mm)"
                                 % (rel * 100, done, meas, cmd))
@@ -7468,9 +7517,12 @@ new Chart(document.getElementById('cvChart'), {
                     bdw, bdw_before, bdw_after, cmd_mm)
                 b = r['bdw']
                 if b.get('meas_mm') is not None:
-                    parts.append("BDWidth %.0f / %.0f mm (%.0f%%)"
+                    parts.append("BDWidth %.0f / %.0f mm (%.0f%%)%s"
                                  % (b['meas_mm'], b['cmd_mm'],
-                                    b['ratio'] * 100))
+                                    b['ratio'] * 100,
+                                    " report only"
+                                    if meta.get('bdwidth_untrusted')
+                                    else ""))
             if enc is not None:
                 r['enc'] = self._encoder_step(enc)
                 gap = r['enc'].get('gap_mm')
@@ -7501,6 +7553,15 @@ new Chart(document.getElementById('cvChart'), {
         def check(results):
             """SG-based slip detection. A HARD failure (filament stopped)
             ends the run here instead of returning to the bisection."""
+            if bdw is not None and not meta.get('bdwidth_untrusted'):
+                why = self._bdw_reliability(results)
+                if why:
+                    meta['bdwidth_untrusted'] = why
+                    gcmd.respond_info(
+                        "  NOTE: %s. Its feed check and slip start are "
+                        "report-only for the rest of this run; heater "
+                        "collapse still stops the test on a real stall."
+                        % why)
             reason = self._check_triggers_sg(results)
             if reason and getattr(self, '_hard_failure', None):
                 results[-1]['hard_fail'] = True
@@ -7623,7 +7684,10 @@ new Chart(document.getElementById('cvChart'), {
             s = self._slip_onset(results)
             if s is None:
                 return
-            if s['onset'] is None:
+            if s.get('untrusted'):
+                meta['slip_onset'] = ('not available — BDWidth does not '
+                                      'track this filament reliably')
+            elif s['onset'] is None:
                 meta['slip_onset'] = ('no slip seen (BDWidth feed stayed '
                                       'within %.0f %% of the low-flow '
                                       'reading up to %.1f mm³/s)'

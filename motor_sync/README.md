@@ -55,7 +55,7 @@ minimal fight, i.e. sync.
 
 ```bash
 cd ~
-git clone https://github.com/Fragmon/crydteamtools.git
+git clone -b awd-sync-and-flow-detection https://github.com/SeeingREDTonight/crydteamtools.git
 cd crydteamtools
 ./install.sh motor_sync
 ```
