@@ -121,7 +121,7 @@ chamber_fans: Nevermore, chamber
 ```
 
 `[fan_generic]` fans run at 100 %; `[temperature_fan]` fans get their
-target set to `min_temp` so they run. Both are restored afterwards.
+target set to 1 °C (or `min_temp`, if higher) so they run. Both are restored afterwards.
 Existing installs keep their settings file — add the line by hand.
 
 **Melt zone length**:

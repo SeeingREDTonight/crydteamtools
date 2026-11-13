@@ -511,7 +511,7 @@ class TMCFlowTest:
         # (air filtering only — they do not change the measurement).
         # Comma-separated names; the type is detected at run start:
         #   [fan_generic X]      → SET_FAN_SPEED FAN=X SPEED=1
-        #   [temperature_fan X]  → target set to its min_temp so it runs
+        #   [temperature_fan X]  → target set to 1 °C (or min_temp) so it runs
         # Previous speed / target is restored when the test ends.
         cf_raw = config.get('chamber_fans', '').strip()
         self.chamber_fans = [n.strip() for n in cf_raw.split(',')
@@ -4113,7 +4113,9 @@ new Chart(document.getElementById('cvChart'), {
                         "SET_FAN_SPEED FAN=%s SPEED=1" % short)
                 else:
                     prev = float(st.get('target', 0.0))
-                    low = float(getattr(obj, 'min_temp', 0.0))
+                    # A target of 0 leaves the fan disabled, so use
+                    # 1 °C (or min_temp, if that is higher).
+                    low = max(float(getattr(obj, 'min_temp', 0.0)), 1.0)
                     self.gcode.run_script_from_command(
                         "SET_TEMPERATURE_FAN_TARGET TEMPERATURE_FAN=%s "
                         "TARGET=%.1f" % (short, low))

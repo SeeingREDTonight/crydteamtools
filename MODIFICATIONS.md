@@ -161,7 +161,7 @@ ignored), plus the last clean step — console, HTML and CSV header
 
 Optional list of fans to run for the whole test (air filtering), e.g.
 `chamber_fans: Nevermore, chamber`. `[fan_generic]` fans run at 100 %;
-`[temperature_fan]` fans get their target set to `min_temp` so they run.
+`[temperature_fan]` fans get their target set to 1 °C (or `min_temp`, if higher) so they run.
 Previous speeds / targets are restored at the end, also on abort.
 
 ### Other fixes
