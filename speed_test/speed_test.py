@@ -40,6 +40,14 @@ class SpeedTest:
             raise config.error(
                 "speed_test: default_axis must be X or Y")
         self.margin = config.getfloat('margin', 20.0, above=0.)
+        # Where to hold the OTHER axis during single-axis tests (unset =
+        # leave it where homing put it). E.g. park_x centres X while Y is
+        # tested, to clear obstacles near the ends of the X travel.
+        self.park_x = config.getfloat('park_x', None)
+        self.park_y = config.getfloat('park_y', None)
+        # G-code run after any step that loses steps, to re-sync dual-motor
+        # pairs (e.g. SYNC_MOTORS from MRX8024/motors-sync). Empty = off.
+        self.skip_resync_gcode = config.get('skip_resync_gcode', '').strip()
         self.z_pos = config.getfloat('z_pos', 20.0, minval=0.)
         self.monitor_tmc = config.getboolean('monitor_tmc', True)
         # Distance from the endstop (start of usable travel) where the jab
@@ -405,6 +413,11 @@ class SpeedTest:
             self.gcode.run_script_from_command(
                 "G1 %s%.3f F%.1f" % (axis, pos, feed))
         else:
+            other, opos = (('X', self.park_x) if axis == 'Y'
+                           else ('Y', self.park_y))
+            if opos is not None:
+                self.gcode.run_script_from_command(
+                    "G1 %s%.3f F%.1f" % (other, opos, feed))
             self.gcode.run_script_from_command(
                 "G1 %s%.3f Z%.3f F%.1f"
                 % (axis, pos, self.z_pos, feed))
@@ -709,6 +722,8 @@ class SpeedTest:
         tmc_stats = {ax: self._tmc_stats(ax) for ax in sample_axes}
 
         failed = bool(skips)
+        if failed and self.skip_resync_gcode and not testbench:
+            self._resync_after_skip(gcmd)
         max_diff = max((d for _, d in skips), default=0)
         skip_axes = ",".join(a for a, _ in skips)
         # On a failure, show the raw counters. A loss that equals the
@@ -744,6 +759,29 @@ class SpeedTest:
             'skip_axes': skip_axes,
             'tmc': tmc_stats,
         }
+
+    def _resync_after_skip(self, gcmd):
+        """A lost step can leave the two motors of a belt out of phase,
+        and homing does not fix that. Run the configured re-sync G-code
+        at the travel limits (never the test limits that just caused
+        the skip), then force a re-home before the next baseline."""
+        v_lim, a_lim, _scv = self._current_limits()
+        self._set_limits(velocity=self.travel_speed,
+                         accel=self.travel_accel)
+        gcmd.respond_info("  lost steps -> re-syncing motors: %s"
+                          % self.skip_resync_gcode)
+        try:
+            self.gcode.run_script_from_command(self.skip_resync_gcode)
+            self.gcode.run_script_from_command("M400")
+        except self.gcode.error as e:
+            gcmd.respond_info(
+                "  WARNING: re-sync failed (%s) - continuing; results "
+                "after this point may read low." % (e,))
+        finally:
+            self._set_limits(velocity=v_lim, accel=a_lim)
+            # The re-sync moved the toolhead: re-home before the next
+            # baseline or that travel would be counted as lost steps.
+            self._ref_valid = False
 
     def _current_limits(self):
         """Live motion limits from the toolhead — reflects the
