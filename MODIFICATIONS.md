@@ -119,6 +119,12 @@ normal SG curve.
 - HTML: new **Melt & feed** tab, full per-step data table with every CSV
   column, melt limit under the result, "Stopped on filament failure"
   status instead of "Verified" for stopped runs.
+- HTML **Compare runs** tab: load CSVs from other runs (e.g. the same
+  filament at other temperatures) to overlay heat-vs-line, BDWidth feed
+  and StallGuard, with a table of target temp, melt limit and result per
+  run. Computed in the browser from the CSVs (older CSVs work too). The
+  CSV that produced the report and files already loaded are rejected.
+- CSV header now also records `result_max_flow` and `result_quality`.
 
 ### Other fixes
 

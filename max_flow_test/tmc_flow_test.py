@@ -2234,6 +2234,7 @@ footer a:hover { text-decoration: underline; }
     <button class="tab" data-target="thermal" onclick="showTab(event, 'thermal')">Thermal profile</button>
     <button class="tab" data-target="variance" onclick="showTab(event, 'variance')">Run-to-run variance</button>
     <button class="tab" data-target="melt" onclick="showTab(event, 'melt')">Melt &amp; feed</button>
+    <button class="tab" data-target="compare" onclick="showTab(event, 'compare')">Compare runs</button>
   </div>
   <div id="tab-sg" class="tab-panel active">
     <div class="chart-card">
@@ -2276,6 +2277,42 @@ footer a:hover { text-decoration: underline; }
         trigger threshold).
       </div>
       <canvas id="cvChart"></canvas>
+    </div>
+  </div>
+  <div id="tab-compare" class="tab-panel">
+    <div class="chart-card">
+      <div class="chart-explainer">
+        <strong>Compare runs.</strong> Load CSVs from other runs of this
+        test (e.g. the same filament at other temperatures) to overlay them
+        on this one. Everything is computed in your browser from the CSVs —
+        the melt limit uses the same low-flow line fit as the plugin, so
+        older CSVs work too. The CSV that produced this report, and files
+        already loaded, are rejected. Solid line = this report, dashed =
+        loaded runs.
+      </div>
+      <input type="file" id="cmpFile" accept=".csv,text/csv" multiple>
+      <div id="cmpMsg" style="margin-top:8px; color: var(--text-tertiary);"></div>
+      <table style="margin-top:12px">
+        <thead><tr><th>Run</th><th>Target temp</th><th>Timestamp</th>
+          <th>Melt limit (mm³/s)</th><th>Result (mm³/s)</th><th>Status</th>
+          <th></th></tr></thead>
+        <tbody id="cmpTable"></tbody>
+      </table>
+    </div>
+    <div class="chart-card">
+      <div class="chart-explainer"><strong>Heat vs low-flow line</strong> —
+        the melt limit is where a run drops below the dashed line.</div>
+      <canvas id="cmpMeltChart"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-explainer"><strong>BDWidth feed</strong> — filament
+        the motion sensor saw vs commanded.</div>
+      <canvas id="cmpBdwChart"></canvas>
+    </div>
+    <div class="chart-card">
+      <div class="chart-explainer"><strong>StallGuard median</strong> per
+        flow step.</div>
+      <canvas id="cmpSgChart"></canvas>
     </div>
   </div>
   <div id="tab-melt" class="tab-panel">
@@ -2462,6 +2499,7 @@ function showTab(event, name) {
     document.getElementById('tab-' + name).classList.add('active');
     // Charts built while their tab was hidden place their annotation
     // lines against a zero-size chart area; redraw them once visible.
+    if (name === 'compare' && window._cmpRender) { window._cmpRender(); }
     if (typeof Chart !== 'undefined') {
         document.querySelectorAll('#tab-' + name + ' canvas').forEach(c => {
             const ch = Chart.getChart(c);
@@ -2552,6 +2590,7 @@ const bdwPct = %(bdw_pct)s;
 const meltPerFlow = %(melt_per_flow)s;
 const bdwMinPct = %(bdw_min_pct)s;
 const meltKneePct = %(melt_knee_pct)s;
+const ownCsv = %(own_csv)s;
 
 Chart.defaults.color = '#8b949e';
 Chart.defaults.borderColor = '#30363d';
@@ -3060,6 +3099,200 @@ new Chart(document.getElementById('cvChart'), {
         },
     });
 })();
+
+// ─── Compare runs: load other CSVs of this test and overlay them ───
+(function () {
+    const PALETTE = ['#388bfd', '#f0883e', '#3fb950', '#a371f7',
+                     '#f85149', '#d29922', '#39c5cf', '#db61a2'];
+    const runs = [];          // {name, meta, rows, label, color}
+    const charts = {};
+    const msg = document.getElementById('cmpMsg');
+
+    function parseCsv(text) {
+        const meta = {};
+        const lines = text.split(/\\r?\\n/);
+        let header = null;
+        const rows = [];
+        for (const line of lines) {
+            if (!line.trim()) continue;
+            if (line.startsWith('#')) {
+                const m = line.match(/^#\\s*([A-Za-z0-9_]+):\\s*(.*)$/);
+                if (m) meta[m[1]] = m[2].trim();
+                continue;
+            }
+            const cells = line.split(',');
+            if (!header) { header = cells; continue; }
+            const r = {};
+            header.forEach((h, i) => { r[h] = cells[i]; });
+            rows.push(r);
+        }
+        if (!header || header.indexOf('flow_mm3s') < 0
+                || header.indexOf('pwm_avg') < 0) {
+            throw new Error('not a TMC flow test CSV (no flow_mm3s / '
+                            + 'pwm_avg columns)');
+        }
+        return {meta: meta, rows: rows};
+    }
+    const num = v => (v === undefined || v === '' || v === null)
+        ? null : (isNaN(+v) ? null : +v);
+
+    // Same line-fit melt analysis as the plugin (works on older CSVs
+    // too): duty = a + b·flow through steps 2–5, drift-corrected with
+    // idle_pwm when present; %% of that line per step.
+    function analyse(run) {
+        const rows = run.rows.filter(r => num(r.flow_mm3s) && num(r.pwm_avg) !== null);
+        const idle0 = num(run.meta.idle_pwm_start);
+        const pts = rows.map(r => {
+            let pwm = num(r.pwm_avg);
+            const ip = num(r.idle_pwm);
+            if (idle0 !== null && ip !== null) pwm -= (ip - idle0);
+            return {flow: num(r.flow_mm3s), pwm: pwm, row: r};
+        });
+        const fit = pts.slice(1, 5);
+        run.fitPct = [];
+        run.knee = null; run.lastOk = null;
+        if (fit.length >= 3 && pts.length >= fit.length + 2) {
+            const n = fit.length;
+            const sx = fit.reduce((s, p) => s + p.flow, 0);
+            const sy = fit.reduce((s, p) => s + p.pwm, 0);
+            const sxx = fit.reduce((s, p) => s + p.flow * p.flow, 0);
+            const sxy = fit.reduce((s, p) => s + p.flow * p.pwm, 0);
+            const den = n * sxx - sx * sx;
+            if (den > 0) {
+                const b = (n * sxy - sx * sy) / den;
+                const a = (sy - b * sx) / n;
+                if (b > 0) {
+                    run.fitPct = pts.map(p => ({x: p.flow,
+                        y: (p.pwm - a) / (b * p.flow) * 100}));
+                    const fitMax = Math.max(...fit.map(p => p.flow));
+                    const later = run.fitPct.filter(p => p.x > fitMax + 0.001)
+                        .sort((u, v) => u.x - v.x);
+                    const k = later.find(p => p.y < meltKneePct);
+                    if (k) {
+                        run.knee = k.x;
+                        const ok = run.fitPct.filter(p => p.x < k.x - 0.001
+                                                      && p.y >= meltKneePct);
+                        run.lastOk = ok.length ? Math.max(...ok.map(p => p.x)) : null;
+                    }
+                }
+            }
+        }
+        run.bdw = rows.filter(r => num(r.bdw_ratio) !== null)
+            .map(r => ({x: num(r.flow_mm3s), y: num(r.bdw_ratio) * 100}));
+        run.sg = rows.filter(r => num(r.sg_median) !== null)
+            .map(r => ({x: num(r.flow_mm3s), y: num(r.sg_median)}))
+            .sort((u, v) => u.x - v.x);
+        run.fitPct.sort((u, v) => u.x - v.x);
+        run.bdw.sort((u, v) => u.x - v.x);
+        const tt = (run.meta.hotend_temp || '').match(/target\\s+([\\d.]+)/);
+        const t0 = rows.length ? num(rows[0].temp_target) : null;
+        run.temp = tt ? +tt[1] : t0;
+        run.label = (run.temp !== null ? run.temp.toFixed(0) + ' °C' : '? °C')
+            + ' · ' + (run.meta.timestamp || run.name);
+    }
+
+    function dataset(run, key) {
+        return { label: run.label, data: run[key], borderColor: run.color,
+                 backgroundColor: run.color, tension: 0, pointRadius: 3,
+                 borderDash: run.own ? [] : [5, 3] };
+    }
+    function draw(id, key, yTitle, ann) {
+        const ds = runs.filter(r => r[key] && r[key].length).map(r => dataset(r, key));
+        const card = document.getElementById(id).closest('.chart-card');
+        card.style.display = ds.length ? '' : 'none';
+        if (charts[id]) charts[id].destroy();
+        if (!ds.length) return;
+        charts[id] = new Chart(document.getElementById(id), {
+            type: 'line', data: { datasets: ds },
+            options: { responsive: true,
+                scales: { x: { type: 'linear', title: { display: true,
+                                  text: 'Flow Rate (mm³/s)' } },
+                          y: { title: { display: true, text: yTitle } } },
+                plugins: { annotation: { annotations: ann || {} } } } });
+    }
+    function render() {
+        draw('cmpMeltChart', 'fitPct', '%% of low-flow line',
+             { knee: { type: 'line', scaleID: 'y', value: meltKneePct,
+                       borderColor: 'rgba(56,139,253,0.5)', borderDash: [6, 4] } });
+        draw('cmpBdwChart', 'bdw', 'BDWidth feed (%%)',
+             bdwMinPct > 0 ? { feed: { type: 'line', scaleID: 'y',
+                       value: bdwMinPct, borderColor: 'rgba(248,81,73,0.5)',
+                       borderDash: [6, 4] } } : {});
+        draw('cmpSgChart', 'sg', 'SG median');
+        const tb = document.getElementById('cmpTable');
+        tb.innerHTML = runs.map(r =>
+            '<tr><td><span style="display:inline-block;width:10px;height:10px;'
+            + 'border-radius:50%%;background:' + r.color + '"></span> '
+            + (r.own ? '<b>this report</b>' : r.name) + '</td>'
+            + '<td>' + (r.temp !== null ? r.temp.toFixed(0) + ' °C' : '-') + '</td>'
+            + '<td>' + (r.meta.timestamp || '-') + '</td>'
+            + '<td>' + (r.lastOk !== null ? r.lastOk.toFixed(1) : (r.fitPct.length ? 'above ' + Math.max(...r.fitPct.map(p => p.x)).toFixed(0) : '-')) + '</td>'
+            + '<td>' + (r.meta.result_max_flow || '-') + '</td>'
+            + '<td>' + (r.meta.result_quality || '-') + '</td>'
+            + '<td>' + (r.own ? '' : '<button class="cmp-rm" data-name="'
+                + r.name.replace(/"/g, '') + '">remove</button>') + '</td></tr>'
+        ).join('');
+        tb.querySelectorAll('.cmp-rm').forEach(b => b.onclick = () => {
+            const i = runs.findIndex(r => !r.own && r.name === b.dataset.name);
+            if (i >= 0) runs.splice(i, 1);
+            render();
+        });
+    }
+    function add(name, text, own) {
+        const p = parseCsv(text);
+        const run = { name: name, meta: p.meta, rows: p.rows, own: own,
+                      text: text.trim(),
+                      color: PALETTE[runs.length %% PALETTE.length] };
+        analyse(run);
+        runs.push(run);
+    }
+
+    try { add('this report', ownCsv, true); }
+    catch (e) { msg.textContent = 'Could not read this report\\'s own data: ' + e.message; }
+
+    document.getElementById('cmpFile').addEventListener('change', ev => {
+        const files = Array.from(ev.target.files || []);
+        const notes = [];
+        let pending = files.length;
+        if (!pending) return;
+        files.forEach(f => {
+            const rd = new FileReader();
+            rd.onload = () => {
+                const text = String(rd.result);
+                try {
+                    const p = parseCsv(text);
+                    const own = runs.find(r => r.own);
+                    const ts = p.meta.timestamp;
+                    if (own && (text.trim() === own.text
+                            || (ts && ts === own.meta.timestamp))) {
+                        notes.push(f.name + ': this is the run that produced '
+                                   + 'this report — skipped.');
+                    } else if (runs.some(r => !r.own && (r.text === text.trim()
+                            || (ts && r.meta.timestamp === ts)))) {
+                        notes.push(f.name + ': already loaded — skipped.');
+                    } else {
+                        add(f.name, text, false);
+                        const run = runs[runs.length - 1];
+                        if (own && run.meta.driver && own.meta.driver
+                                && run.meta.driver !== own.meta.driver) {
+                            notes.push(f.name + ': different driver/extruder ('
+                                       + run.meta.driver + ').');
+                        }
+                    }
+                } catch (e) {
+                    notes.push(f.name + ': ' + e.message);
+                }
+                if (--pending === 0) {
+                    msg.textContent = notes.join('  ');
+                    ev.target.value = '';
+                    render();
+                }
+            };
+            rd.readAsText(f);
+        });
+    });
+    window._cmpRender = render;
+})();
 </script>
 </body>
 </html>"""
@@ -3176,6 +3409,8 @@ new Chart(document.getElementById('cvChart'), {
             'bdw_min_pct': json.dumps(
                 (getattr(self, '_bdw_min_ratio', 0.0) or 0.0) * 100),
             'melt_knee_pct': json.dumps(self.MELT_KNEE_FRAC * 100),
+            'own_csv': json.dumps(self._csv_text(results, meta)).replace(
+                '</', '<\\/'),
             'cv_trigger': json.dumps(cv_trigger_threshold),
             'chart_events': json.dumps(chart_events),
             'trigger_flow': json.dumps(first_trigger_flow),
@@ -3207,12 +3442,37 @@ new Chart(document.getElementById('cvChart'), {
         with open(path, 'w') as f:
             f.write(rendered)
 
+    def _csv_text(self, results, meta):
+        """This run's CSV as a string (embedded in the HTML report so the
+        Compare tab can treat it exactly like a loaded CSV)."""
+        import tempfile
+        fd, tmp = tempfile.mkstemp(suffix='.csv')
+        os.close(fd)
+        try:
+            self._write_csv(tmp, results, meta)
+            with open(tmp) as f:
+                return f.read()
+        except Exception:
+            return ''
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
     def _save_report(self, results, meta, timestamp, limit_reason,
                      no_html, gcmd=None, announce=True,
                      final_result=None):
         """Save CSV and HTML report. Safe to call repeatedly."""
         if not results:
             return
+        if final_result:
+            # Recorded in the CSV header too, so the HTML comparison can
+            # show other runs' results from their CSV alone.
+            if final_result.get('max_safe') is not None:
+                meta['result_max_flow'] = '%.1f' % final_result['max_safe']
+            if final_result.get('quality'):
+                meta['result_quality'] = final_result['quality']
         try:
             os.makedirs(self.output_dir, exist_ok=True)
             csv_path = os.path.join(
