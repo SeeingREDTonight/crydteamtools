@@ -1,3 +1,7 @@
+> **Modified fork.** This branch adds changes to the speed test and the
+> flow test on top of upstream `dev` (commit `062d1dc`). See
+> [MODIFICATIONS.md](MODIFICATIONS.md) for what changed and why.
+
 # Crydteam Tools for Klipper
 
 A collection of Klipper diagnostic and tuning plugins by **Steven (Fragmon) — Crydteam**.
