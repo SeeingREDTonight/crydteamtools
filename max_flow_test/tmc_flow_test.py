@@ -192,6 +192,23 @@ class TriggerProfile:
     # thermal limit; higher flows are not sustainable in a real print.
     PWM_SATURATED = 0.95
 
+    # ─── _check_heater_collapse thresholds (all drivers) ──────────
+    # Melting more plastic takes more heat, so heater duty must RISE
+    # with flow. If the commanded flow goes up but duty falls sharply,
+    # the filament has stopped arriving (stall, grind or clog). This
+    # also catches a motor that loses sync at move start and then sits
+    # still in a spinning field — SG keeps tracking the commanded step
+    # rate there, so every SG trigger stays blind, and a strong heater
+    # PID can hold the overshoot under TEMP_RUNAWAY_ABS.
+    # Observed: TMC5160 run (2026-11-12) with a stall at move start:
+    # duty 0.378 → 0.268 (−29 %) at the stall step, vs +5..10 % per
+    # healthy step; repeat run −31 %.
+    # PLA strip (2026-11-12 19:39) happened mid-step: −11 % / −0.040 at
+    # the strip step. Biggest drop across three clean runs: −5 % /
+    # −0.019. So 10 % / 0.03 catches the strip step with ~2x margin.
+    PWM_COLLAPSE_FRAC = 0.10        # duty < (1 − this) × lower-flow step
+    PWM_COLLAPSE_MIN_ABS = 0.03     # AND an absolute drop of ≥ 3 % duty
+
     # ─── _check_run_outlier thresholds ─────────────────────────────
     OUTLIER_MAD_RATIO = 4.0         # deviation ≥ this × MAD
     OUTLIER_MIN_REL = 0.08          # AND ≥ 8 % of median
@@ -430,6 +447,13 @@ def get_trigger_profile(driver_type):
     # Default: TMC5160-style SG2 profile (covers tmc5160, tmc2130, tmc2660,
     # and any unknown driver — safest fallback).
     return TMC5160Profile
+
+
+class _HardStop(Exception):
+    """Raised after a hard filament failure (heater collapse or BDWidth
+    feed): the filament is stripped, stalled or clogged, so bisecting
+    further would only grind it. The run has already been finalised
+    and reported when this is raised."""
 
 
 class TMCFlowTest:
@@ -933,7 +957,37 @@ class TMCFlowTest:
                 ",extra_%s_min,extra_%s_avg,extra_%s_max"
                 % (_sanitize_csv(n), _sanitize_csv(n), _sanitize_csv(n))
                 for n in extra_names)
-            f.write(base_header + extra_header + "\n")
+            data_header = (",t_s,idle_pwm,melt_duty,"
+                           "melt_duty_per_flow,melt_fit_pct,"
+                           "bdw_cmd_mm,bdw_meas_mm,bdw_ratio")
+            f.write(base_header + extra_header + data_header + "\n")
+
+            # Heat per mm³ vs the fitted low-flow line, in % (only once
+            # the run has finished and the fit is in meta).
+            def fit_pct(r):
+                fa = meta.get('melt_fit_intercept')
+                fb = meta.get('melt_fit_slope')
+                pwm_r = (r.get('thermal') or {}).get('pwm_avg')
+                if fa is None or not fb or pwm_r is None or not r['flow']:
+                    return None
+                p0 = meta.get('idle_pwm_start')
+                cur = _idle_at(r.get('t_s'))
+                drift = (cur - p0) if (p0 is not None
+                                       and cur is not None) else 0.0
+                return (pwm_r - drift - fa) / (fb * r['flow']) * 100
+
+            # Idle duty at a step's time: linear between the start and
+            # end baselines when both exist (corrects chamber drift).
+            def _idle_at(t):
+                p0 = meta.get('idle_pwm_start')
+                p1 = meta.get('idle_pwm_end')
+                t1 = meta.get('idle_t_end_s')
+                if p0 is None:
+                    return p1
+                if p1 is None or not t1 or t is None:
+                    return p0
+                frac = min(max(t / t1, 0.0), 1.0)
+                return p0 + (p1 - p0) * frac
 
             for r in results:
                 sg = r.get('sg') or {}
@@ -1006,9 +1060,30 @@ class TMCFlowTest:
                     extra_cols.append(fmt_t(e, 'min'))
                     extra_cols.append(fmt_t(e, 'avg'))
                     extra_cols.append(fmt_t(e, 'max'))
+                idle = _idle_at(r.get('t_s'))
+                pwm_a = th.get('pwm_avg')
+                melt = (pwm_a - idle) if (idle is not None
+                                          and pwm_a is not None) else None
+                b = r.get('bdw') or {}
+
+                def f_or(v, fmt_s):
+                    return (fmt_s % v) if v is not None else ''
+                data_cols = [
+                    f_or(r.get('t_s'), '%.1f'),
+                    f_or(idle, '%.4f'),
+                    f_or(melt, '%.4f'),
+                    f_or(melt / r['flow'] if (melt is not None
+                                              and r['flow']) else None,
+                         '%.6f'),
+                    f_or(fit_pct(r), '%.1f'),
+                    f_or(b.get('cmd_mm'), '%.1f'),
+                    f_or(b.get('meas_mm'), '%.1f'),
+                    f_or(b.get('ratio'), '%.4f'),
+                ]
                 f.write(base_row
                         + ("," + ",".join(extra_cols)
                            if extra_cols else "")
+                        + "," + ",".join(data_cols)
                         + "\n")
 
     def _write_html(self, path, results, meta, limit_reason,
@@ -1369,18 +1444,48 @@ class TMCFlowTest:
                     return '-'
                 return fs % v
 
+            th = r.get('thermal') or {}
+            dip = r.get('dip') or {}
+            peak = r.get('peak') or {}
+            ex = self._step_extras(r, meta)
+
+            def opt(v, fs):
+                return (fs % v) if v is not None else '-'
+            fail_style = (' style="background:rgba(248,81,73,0.18)"'
+                          if r.get('hard_fail') else '')
             rows.append(
-                "<tr><td>%.1f</td><td><b>%s</b></td>"
+                "<tr%s><td>%s</td><td>%.1f</td><td><b>%s</b></td>"
+                "<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>"
+                "<td>%d</td><td%s>%s</td><td>%s</td><td>%s</td>"
                 "<td>%s</td><td>%s</td><td>%s</td>"
-                "<td>%d</td><td%s>%s</td></tr>" % (
-                    r['flow'], fmt(sg, 'median'),
+                "<td>%s</td><td>%s</td><td>%s</td><td>%s</td>"
+                "<td>%s</td><td>%s</td><td>%s</td></tr>" % (
+                    fail_style,
+                    r.get('phase', ''), r['flow'], fmt(sg, 'median'),
                     fmt(sg, 'p25'), fmt(sg, 'p75'), fmt(sg, 'avg'),
-                    sg.get('n', 0), cv_class, cv_str or '-'))
+                    opt(sg.get('min'), '%s'), opt(sg.get('max'), '%s'),
+                    sg.get('n', 0), cv_class, cv_str or '-',
+                    opt(dip.get('count'), '%d'), opt(peak.get('count'), '%d'),
+                    opt(th.get('temp_avg'), '%.1f'),
+                    opt(th.get('pwm_avg'), '%.3f'),
+                    opt(r.get('t_s'), '%.0f'),
+                    opt(ex['idle'], '%.3f'),
+                    opt(ex['melt'], '%.3f'),
+                    opt(ex['melt_per_flow'], '%.5f'),
+                    opt(ex['fit_pct'], '%.0f%%'),
+                    opt(ex['bdw_cmd'], '%.0f'),
+                    opt(ex['bdw_meas'], '%.0f'),
+                    opt(ex['bdw_pct'], '%.0f%%')))
 
         table_header = (
-            "<th>Flow (mm³/s)</th><th>%s median</th>"
+            "<th>Phase</th><th>Flow (mm³/s)</th><th>%s median</th>"
             "<th>%s P25</th><th>%s P75</th><th>%s avg</th>"
-            "<th>n</th><th>Inter-run CV</th>"
+            "<th>min</th><th>max</th>"
+            "<th>n</th><th>Inter-run CV</th><th>Dips</th><th>Peaks</th>"
+            "<th>Temp avg (°C)</th><th>Heater duty</th><th>t (s)</th>"
+            "<th>Idle duty</th><th>Melt duty</th><th>Melt / mm³</th>"
+            "<th>vs low-flow line</th>"
+            "<th>BDW cmd (mm)</th><th>BDW meas (mm)</th><th>BDW feed</th>"
             % (sg_label, sg_label, sg_label, sg_label))
 
         table = ("<table><thead><tr>" + table_header
@@ -1400,7 +1505,11 @@ class TMCFlowTest:
             status_class = 'success'
             status_text = 'Verified — CV %.1f%% over %d runs' % (
                 verify_cv_for_hero, verify_repeats_for_hero)
-            if quality_for_hero in ('borderline', 'fragile'):
+            if str(quality_for_hero).startswith('stopped'):
+                status_text = ('Stopped on filament failure — last step '
+                               'that fed cleanly')
+            if (quality_for_hero in ('borderline', 'fragile')
+                    or str(quality_for_hero).startswith('stopped')):
                 status_class = 'warning'
             hero_html = (
                 '<div class="hero">'
@@ -1442,6 +1551,16 @@ class TMCFlowTest:
                 '</div>'
                 % stop_text)
 
+        # Melt limit (print quality) and fit warning under the hero
+        if meta.get('melt_limit'):
+            hero_html += (
+                '<div class="summary" style="margin-top:12px">'
+                '<strong>Melt limit (print quality):</strong> %s'
+                '%s</div>'
+                % (meta['melt_limit'],
+                   ('<br><em>Note: %s</em>' % meta['melt_fit_warning'])
+                   if meta.get('melt_fit_warning') else ''))
+
         # Insights cards: 4 quick-glance summaries
         # 1) Result Quality
         if max_safe is not None:
@@ -1458,15 +1577,20 @@ class TMCFlowTest:
                 quality_value = quality_ic.title()
             elif quality_ic == '':
                 quality_value = 'Done'
+            quality_detail = ('CV %.1f%% across %d verify runs'
+                              % (verify_cv_ic, verify_n_ic))
+            if str(quality_ic).startswith('stopped'):
+                quality_card_class = 'warning'
+                quality_value = 'Stopped'
+                quality_detail = ('filament failure — last clean step, '
+                                  'not verified')
             quality_card = (
                 '<div class="insight-card %s">'
                 '<div class="insight-icon">✓</div>'
                 '<div class="insight-title">Result Quality</div>'
                 '<div class="insight-value">%s</div>'
-                '<div class="insight-detail">CV %.1f%% across %d verify '
-                'runs</div></div>'
-                % (quality_card_class, quality_value, verify_cv_ic,
-                   verify_n_ic))
+                '<div class="insight-detail">%s</div></div>'
+                % (quality_card_class, quality_value, quality_detail))
         else:
             quality_card = (
                 '<div class="insight-card warning">'
@@ -2105,6 +2229,7 @@ footer a:hover { text-decoration: underline; }
     <button class="tab active" data-target="sg" onclick="showTab(event, 'sg')">StallGuard signal</button>
     <button class="tab" data-target="thermal" onclick="showTab(event, 'thermal')">Thermal profile</button>
     <button class="tab" data-target="variance" onclick="showTab(event, 'variance')">Run-to-run variance</button>
+    <button class="tab" data-target="melt" onclick="showTab(event, 'melt')">Melt &amp; feed</button>
   </div>
   <div id="tab-sg" class="tab-panel active">
     <div class="chart-card">
@@ -2147,6 +2272,27 @@ footer a:hover { text-decoration: underline; }
         trigger threshold).
       </div>
       <canvas id="cvChart"></canvas>
+    </div>
+  </div>
+  <div id="tab-melt" class="tab-panel">
+    <div class="chart-card" id="meltChartCard">
+      <div class="chart-explainer">
+        <strong>Heat vs the low-flow line</strong> (blue): heater duty above
+        idle compared with the straight line fitted through the healthy
+        low-flow steps. Flat near 100 %% = the plastic fully melts; the
+        first drop below the dashed 85 %% line is the <em>melt limit</em>
+        (print quality). <strong>BDWidth feed</strong> (orange): filament
+        the motion sensor saw entering the extruder vs commanded. A sharp
+        drop means slip or a stall; the red dashed line is the feed-check
+        limit. Sensor accuracy depends on the filament surface.
+      </div>
+      <canvas id="meltChart"></canvas>
+    </div>
+    <div class="chart-card" id="meltChartEmpty" style="display:none;">
+      <p style="color: var(--text-tertiary); text-align: center; padding: 40px;">
+        No melt or BDWidth data for this run (needs IDLE &gt; 0 and/or a
+        bdwidth sensor).
+      </p>
     </div>
   </div>
 </div>
@@ -2310,6 +2456,14 @@ function showTab(event, name) {
     document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
     event.currentTarget.classList.add('active');
     document.getElementById('tab-' + name).classList.add('active');
+    // Charts built while their tab was hidden place their annotation
+    // lines against a zero-size chart area; redraw them once visible.
+    if (typeof Chart !== 'undefined') {
+        document.querySelectorAll('#tab-' + name + ' canvas').forEach(c => {
+            const ch = Chart.getChart(c);
+            if (ch) { ch.resize(); ch.update(); }
+        });
+    }
 }
 
 // ─── Setup-notes persistence ────────────────────────────────────────
@@ -2389,6 +2543,11 @@ const stressScores = %(stress_scores)s;
 const intraDrift = %(intra_drift)s;
 const extrasNames = %(extras_names)s;
 const extrasData = %(extras_data)s;
+const meltFitPct = %(melt_fit_pct)s;
+const bdwPct = %(bdw_pct)s;
+const meltPerFlow = %(melt_per_flow)s;
+const bdwMinPct = %(bdw_min_pct)s;
+const meltKneePct = %(melt_knee_pct)s;
 
 Chart.defaults.color = '#8b949e';
 Chart.defaults.borderColor = '#30363d';
@@ -2849,6 +3008,54 @@ new Chart(document.getElementById('cvChart'), {
         },
     },
 });
+
+(function () {
+    const meltPts = flows.map((f, i) => (meltFitPct[i] === null ? null
+        : {x: f, y: meltFitPct[i]})).filter(p => p !== null);
+    const bdwPts = flows.map((f, i) => (bdwPct[i] === null ? null
+        : {x: f, y: bdwPct[i]})).filter(p => p !== null);
+    if (!meltPts.length && !bdwPts.length) {
+        document.getElementById('meltChartCard').style.display = 'none';
+        document.getElementById('meltChartEmpty').style.display = '';
+        return;
+    }
+    const ann = {};
+    if (meltPts.length) {
+        ann.knee = { type: 'line', scaleID: 'y', value: meltKneePct,
+            borderColor: 'rgba(56, 139, 253, 0.6)', borderDash: [6, 4],
+            label: { display: true, content: 'melt limit ' + meltKneePct + '%%',
+                     position: 'start', backgroundColor: '#388bfd',
+                     color: 'white', font: {size: 10}, padding: 3 } };
+    }
+    if (bdwPts.length && bdwMinPct > 0) {
+        ann.feed = { type: 'line', scaleID: 'y', value: bdwMinPct,
+            borderColor: 'rgba(248, 81, 73, 0.6)', borderDash: [6, 4],
+            label: { display: true, content: 'feed check ' + bdwMinPct + '%%',
+                     position: 'end', backgroundColor: '#f85149',
+                     color: 'white', font: {size: 10}, padding: 3 } };
+    }
+    new Chart(document.getElementById('meltChart'), {
+        type: 'line',
+        data: { datasets: [
+            { label: 'Heat vs low-flow line (%%)', data: meltPts,
+              borderColor: '#388bfd', backgroundColor: '#388bfd',
+              tension: 0, pointRadius: 3 },
+            { label: 'BDWidth feed (%%)', data: bdwPts,
+              borderColor: '#d29922', backgroundColor: '#d29922',
+              tension: 0, pointRadius: 3 },
+        ]},
+        options: {
+            responsive: true,
+            scales: {
+                x: { type: 'linear',
+                     title: { display: true, text: 'Flow Rate (mm³/s)' } },
+                y: { title: { display: true, text: '%% of expected' },
+                     suggestedMin: 0, suggestedMax: 115 },
+            },
+            plugins: { annotation: { annotations: ann } },
+        },
+    });
+})();
 </script>
 </body>
 </html>"""
@@ -2953,6 +3160,18 @@ new Chart(document.getElementById('cvChart'), {
             'sg_p75': json.dumps(sg_p75),
             'sg_avg': json.dumps(sg_avg),
             'cv_data': json.dumps(cv_data),
+            'melt_fit_pct': json.dumps(
+                [self._step_extras(r, meta)['fit_pct']
+                 for r in results_for_charts]),
+            'bdw_pct': json.dumps(
+                [self._step_extras(r, meta)['bdw_pct']
+                 for r in results_for_charts]),
+            'melt_per_flow': json.dumps(
+                [self._step_extras(r, meta)['melt_per_flow']
+                 for r in results_for_charts]),
+            'bdw_min_pct': json.dumps(
+                (getattr(self, '_bdw_min_ratio', 0.0) or 0.0) * 100),
+            'melt_knee_pct': json.dumps(self.MELT_KNEE_FRAC * 100),
             'cv_trigger': json.dumps(cv_trigger_threshold),
             'chart_events': json.dumps(chart_events),
             'trigger_flow': json.dumps(first_trigger_flow),
@@ -3362,6 +3581,154 @@ new Chart(document.getElementById('cvChart'), {
             'n_valid_runs': len(valid),
         }
 
+    # ─── Data-collection helpers (no triggers) ─────────────────────
+
+    def _measure_idle_baseline(self, gcmd, settle_s, idle_s, label):
+        """Hold temperature without extruding, then average the heater
+        duty. This is the zero-flow point for the heat-per-mm³ columns.
+        Returns {'pwm', 'temp', 't_mid'} or None."""
+        gcmd.respond_info(
+            "\n>>> Idle heater baseline (%s): settling %.0f s, then "
+            "measuring %.0f s — no extrusion <<<" % (label, settle_s, idle_s))
+        self.gcode.run_script_from_command("M400")
+        if settle_s > 0:
+            self.gcode.run_script_from_command(
+                "G4 P%d" % int(settle_s * 1000))
+        t_start = self.reactor.monotonic()
+        pwms, temps = [], []
+        n = max(1, int(idle_s / 0.5))
+        for _ in range(n):
+            snap = self._get_thermal_snapshot()
+            if snap.get('heater_pwm') is not None:
+                pwms.append(snap['heater_pwm'])
+            if snap.get('temp_actual') is not None:
+                temps.append(snap['temp_actual'])
+            self.gcode.run_script_from_command("G4 P500")
+        if not pwms:
+            gcmd.respond_info("  Idle baseline: no heater PWM available.")
+            return None
+        res = {'pwm': sum(pwms) / len(pwms),
+               'temp': (sum(temps) / len(temps)) if temps else 0.0,
+               't_mid': (t_start + self.reactor.monotonic()) / 2.0}
+        gcmd.respond_info(
+            "  Idle heater duty (%s): %.1f %% at %.1f°C (%d samples)"
+            % (label, res['pwm'] * 100, res['temp'], len(pwms)))
+        return res
+
+    def _resolve_bdwidth(self, gcmd, param):
+        """Find a bdwidth sensor (markniu/bdwidth). Reads its internal
+        motion accumulator, which is not part of its public status, so
+        anything missing simply disables the motion columns."""
+        if param.lower() in ('none', 'off', '0'):
+            return None
+        obj = None
+        name = None
+        for full_name, o in self.printer.lookup_objects():
+            if not full_name.startswith('bdwidth'):
+                continue
+            short = full_name.split(None, 1)[-1]
+            if param.lower() == 'auto' or param in (short, full_name):
+                obj, name = o, full_name
+                break
+        if obj is None:
+            if param.lower() != 'auto':
+                gcmd.respond_info("BDWidth '%s' not found — motion "
+                                  "columns disabled." % param)
+            return None
+        if not hasattr(obj, 'actual_total_move'):
+            gcmd.respond_info("BDWidth '%s' has no motion accumulator "
+                              "(module version?) — motion columns "
+                              "disabled." % name)
+            return None
+        mode = str(getattr(obj, 'is_active', '?'))
+        info = {'obj': obj, 'name': name,
+                'short': name.split(None, 1)[-1],
+                'orig_mode': mode, 'mode': mode,
+                'counts_per_mm': float(getattr(obj, 'linear_motion', 42.8)),
+                'sample_time': float(getattr(obj, 'sample_time', 1.0))}
+        gcmd.respond_info("BDWidth motion data: using '%s' (mode=%s)."
+                          % (name, mode))
+        return info
+
+    def _bdwidth_prepare(self, gcmd, bdw):
+        """Switch the sensor to motion-only for the test: width
+        compensation would change the extrusion multiplier (so the
+        delivered flow differs from the commanded one), and with the
+        sensor disabled its motion counter does not update at all."""
+        # bdwidth's own runout check prints two console lines per poll
+        # while the filament is stalled, and could pause the printer
+        # mid-test. The flow test has its own feed check, so push the
+        # runout distance out of reach for the duration.
+        obj = bdw['obj']
+        if hasattr(obj, 'runout_delay_length'):
+            bdw['orig_runout_delay'] = obj.runout_delay_length
+            obj.runout_delay_length = 1.0e9
+            try:
+                obj._update_filament_runout_pos()
+            except Exception:
+                pass
+        if bdw['orig_mode'].strip() == 'motion':
+            return
+        self.gcode.run_script_from_command(
+            "SET_BDWIDTH NAME=%s COMMAND=ENABLE_MOTION\nM221 S100"
+            % bdw['short'])
+        bdw['mode'] = str(getattr(bdw['obj'], 'is_active', 'motion'))
+        gcmd.respond_info(
+            "BDWidth '%s' switched to motion-only for the test (was %s); "
+            "extrusion multiplier reset to 100 %%. Restored at the end."
+            % (bdw['name'], bdw['orig_mode']))
+
+    def _bdwidth_restore(self, gcmd, bdw):
+        """Put the sensor back in the mode it had before the test."""
+        obj = bdw['obj']
+        if 'orig_runout_delay' in bdw:
+            obj.runout_delay_length = bdw.pop('orig_runout_delay')
+            try:
+                obj._update_filament_runout_pos()
+            except Exception:
+                pass
+        orig = bdw['orig_mode'].strip()
+        if orig == bdw['mode'].strip():
+            return
+        if 'disable' in orig:
+            cmd = 'DISABLE'
+        elif orig == 'width':
+            cmd = 'ENABLE_WIDTH'
+        elif orig == 'motion':
+            cmd = 'ENABLE_MOTION'
+        else:
+            cmd = 'ENABLE'           # 'all'
+        try:
+            self.gcode.run_script_from_command(
+                "SET_BDWIDTH NAME=%s COMMAND=%s" % (bdw['short'], cmd))
+            bdw['mode'] = orig
+            gcmd.respond_info("BDWidth '%s' restored to mode=%s."
+                              % (bdw['name'], orig))
+        except Exception as e:
+            gcmd.respond_info("Could not restore BDWidth mode (%s) — "
+                              "run SET_BDWIDTH NAME=%s COMMAND=%s"
+                              % (e, bdw['short'], cmd))
+
+    def _bdwidth_total(self, bdw):
+        """Wait until the sensor has polled past all motion so far,
+        then return its accumulated count."""
+        wait_ms = int((bdw['sample_time'] * 1.5 + 0.3) * 1000)
+        self.gcode.run_script_from_command("M400\nG4 P%d" % wait_ms)
+        try:
+            return float(bdw['obj'].actual_total_move)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _bdwidth_step(bdw, before, after, cmd_mm):
+        out = {'cmd_mm': cmd_mm, 'meas_mm': None, 'ratio': None}
+        if before is None or after is None or bdw['counts_per_mm'] <= 0:
+            return out
+        meas = (after - before) / bdw['counts_per_mm']
+        out['meas_mm'] = meas
+        out['ratio'] = meas / cmd_mm if cmd_mm > 0 else None
+        return out
+
     def _measure_step(self, gcmd, target_flow, step_duration, repeat,
                       skip_warmup=True):
         """Run a single flow measurement (multiple repetitions, aggregate)."""
@@ -3593,6 +3960,25 @@ new Chart(document.getElementById('cvChart'), {
         # themselves with len(sg_deltas) >= 3 (needs 5 results). The
         # old flat len<5 gate left the first 4 coarse steps entirely
         # trigger-blind — a stall on step 4 went unnoticed.
+        # Heater-collapse needs only ONE lower-flow step to compare
+        # against, and it does not read StallGuard, so it runs before
+        # the history gate below.
+        # Both of these mean the filament physically stopped. They are
+        # flagged HARD so the run ends instead of bisecting on chewed
+        # filament (see _run_find_max: check()).
+        self._hard_failure = None
+        heater_reason = self._check_heater_collapse(results)
+        if heater_reason:
+            self._hard_failure = heater_reason
+            return heater_reason
+
+        # Feed check: needs no history at all, so it also covers a
+        # stall on the very first step.
+        feed_reason = self._check_bdwidth_feed(results)
+        if feed_reason:
+            self._hard_failure = feed_reason
+            return feed_reason
+
         if not results or len(results) < 3:
             return None
 
@@ -3847,6 +4233,202 @@ new Chart(document.getElementById('cvChart'), {
             return outlier_reason
 
         return None
+
+    MELT_KNEE_FRAC = 0.85   # heat per mm³ below this × baseline = knee
+
+    def _step_extras(self, r, meta):
+        """Per-step data-collection values for reports: idle duty at the
+        step's time, melt duty (above idle), melt duty per mm³, % of the
+        fitted low-flow line (once the fit is in meta) and BDWidth."""
+        pwm = (r.get('thermal') or {}).get('pwm_avg')
+        idle = self._idle_pwm_at(meta, r.get('t_s'))
+        melt = (pwm - idle) if (pwm is not None and idle is not None) else None
+        flow = r.get('flow') or 0.0
+        fit_pct = None
+        fa = meta.get('melt_fit_intercept')
+        fb = meta.get('melt_fit_slope')
+        if fa is not None and fb and pwm is not None and flow:
+            p0 = meta.get('idle_pwm_start')
+            drift = (idle - p0) if (p0 is not None
+                                     and idle is not None) else 0.0
+            fit_pct = (pwm - drift - fa) / (fb * flow) * 100
+        b = r.get('bdw') or {}
+        ratio = b.get('ratio')
+        return {
+            'idle': idle,
+            'melt': melt,
+            'melt_per_flow': (melt / flow) if (melt is not None
+                                               and flow) else None,
+            'fit_pct': fit_pct,
+            'bdw_cmd': b.get('cmd_mm'),
+            'bdw_meas': b.get('meas_mm'),
+            'bdw_pct': (ratio * 100) if ratio is not None else None,
+        }
+
+    @staticmethod
+    def _idle_pwm_at(meta, t):
+        p0 = meta.get('idle_pwm_start')
+        p1 = meta.get('idle_pwm_end')
+        t1 = meta.get('idle_t_end_s')
+        if p0 is None:
+            return p1
+        if p1 is None or not t1 or t is None:
+            return p0
+        frac = min(max(t / t1, 0.0), 1.0)
+        return p0 + (p1 - p0) * frac
+
+    MELT_FIT_STEPS = 4      # steps 2..5 in run order define the line
+    MELT_OFFSET_WARN = 0.05 # |fit intercept − measured idle| above this
+
+    def _melt_fit(self, results, meta):
+        """Straight line heater-duty = a + b·flow through the healthy
+        low-flow steps (steps 2–5 in run order; step 1 reads low while
+        things warm up). Duty is drift-corrected with the start/end idle
+        baselines. Fitting the line instead of dividing by the measured
+        idle absorbs the constant per-rep offset that otherwise makes
+        heat-per-mm³ slide down from the first step on."""
+        p0 = meta.get('idle_pwm_start')
+        pts = []
+        for r in results:
+            pwm = (r.get('thermal') or {}).get('pwm_avg')
+            if pwm is None or not r.get('flow') or r.get('hard_fail'):
+                continue
+            drift = 0.0
+            if p0 is not None:
+                cur_idle = self._idle_pwm_at(meta, r.get('t_s'))
+                if cur_idle is not None:
+                    drift = cur_idle - p0
+            pts.append((r['flow'], pwm - drift))
+        fit_pts = pts[1:1 + self.MELT_FIT_STEPS]
+        if len(fit_pts) < 3 or len(pts) < len(fit_pts) + 2:
+            return None
+        n = len(fit_pts)
+        sx = sum(f for f, _ in fit_pts)
+        sy = sum(v for _, v in fit_pts)
+        sxx = sum(f * f for f, _ in fit_pts)
+        sxy = sum(f * v for f, v in fit_pts)
+        den = n * sxx - sx * sx
+        if den <= 0:
+            return None
+        b = (n * sxy - sx * sy) / den
+        a = (sy - b * sx) / n
+        return {'a': a, 'b': b, 'pts': pts,
+                'fit_max_flow': max(f for f, _ in fit_pts)}
+
+    def _melt_knee(self, results, meta):
+        """Quality limit from the heater: each step's duty above the
+        fitted intercept vs what the low-flow line predicts. The first
+        flow where it drops below MELT_KNEE_FRAC is the melt limit.
+        Report only — never stops the test."""
+        fit = self._melt_fit(results, meta)
+        if fit is None:
+            return None
+        a, b = fit['a'], fit['b']
+        frac = self.MELT_KNEE_FRAC
+        out = {'intercept': a, 'slope': b, 'frac': frac, 'warn': None}
+        if b <= 0:
+            out['warn'] = ('low-flow heater duty does not rise with flow '
+                           '(slope %.5f) — melt limit not available' % b)
+            out['knee'] = None
+            out['max_tested'] = max(f for f, _ in fit['pts'])
+            return out
+        idle0 = meta.get('idle_pwm_start')
+        if idle0 is not None and abs(a - idle0) > self.MELT_OFFSET_WARN:
+            out['warn'] = ('fit intercept %.3f is %.3f away from the '
+                           'measured idle %.3f — treat the melt limit '
+                           'with caution' % (a, a - idle0, idle0))
+        later = sorted((f, (v - a) / (b * f)) for f, v in fit['pts']
+                       if f > fit['fit_max_flow'] + 0.001)
+        knee = next(((f, rt) for f, rt in later if rt < frac), None)
+        if knee is None:
+            out['knee'] = None
+            out['max_tested'] = max(f for f, _ in fit['pts'])
+            return out
+        ok = [f for f, v in fit['pts']
+              if f < knee[0] - 0.001 and (v - a) / (b * f) >= frac]
+        out.update({'knee': knee[0], 'knee_ratio': knee[1],
+                    'last_ok': max(ok) if ok else None})
+        return out
+
+    def _check_bdwidth_feed(self, results):
+        """Filament did not move: the BDWidth motion sensor (before the
+        extruder) saw far less filament than the step commanded. Catches
+        a motor that loses sync and sits still, a stripped/slipping
+        drive and a hard clog, whatever StallGuard reads.
+
+        The sensor's scale and per-step noise are loose (±5 %, one
+        −25 % dropout seen in 10 steps), so the threshold is coarse and
+        the ratio is scale-corrected by the median of the earlier steps
+        (clamped to 0.8–1.2; 1.0 until two earlier steps exist).
+        """
+        min_ratio = getattr(self, '_bdw_min_ratio', 0.0) or 0.0
+        if min_ratio <= 0 or not results:
+            return None
+        cur = results[-1].get('bdw') or {}
+        ratio = cur.get('ratio')
+        if ratio is None:
+            return None
+        prior = sorted(r['bdw']['ratio'] for r in results[:-1]
+                       if (r.get('bdw') or {}).get('ratio') is not None)
+        if len(prior) >= 2:
+            n = len(prior)
+            scale = (prior[n // 2] if n % 2
+                     else (prior[n // 2 - 1] + prior[n // 2]) / 2.0)
+            scale = min(max(scale, 0.8), 1.2)
+        else:
+            scale = 1.0
+        rel = ratio / scale
+        if rel >= min_ratio:
+            return None
+        return ("BDWidth saw %.0f %% of the expected filament feed "
+                "(%.1f of %.1f mm, sensor scale %.2f) — below the %.0f %% "
+                "limit, so the filament stopped moving (stall, slip or "
+                "clog)" % (rel * 100, cur.get('meas_mm') or 0.0,
+                           cur.get('cmd_mm') or 0.0, scale,
+                           min_ratio * 100))
+
+    def _check_heater_collapse(self, results):
+        """Detect that the hotend stopped melting the commanded flow.
+
+        Compares this step's average heater duty (active extrusion
+        samples only) with the step at the highest flow BELOW this one.
+        That reference is always a step that passed: once a step fails,
+        every later probe sits below it. Valid in coarse, bisection and
+        verify alike.
+
+        Fires when duty fell by more than PWM_COLLAPSE_FRAC and by at
+        least PWM_COLLAPSE_MIN_ABS even though more flow was commanded.
+        """
+        if not results or len(results) < 2:
+            return None
+        p = self.profile
+        cur = results[-1]
+        flow = cur.get('flow')
+        pwm = (cur.get('thermal') or {}).get('pwm_avg')
+        if flow is None or pwm is None:
+            return None
+        ref = None
+        for r in results[:-1]:
+            rf = r.get('flow')
+            rp = (r.get('thermal') or {}).get('pwm_avg')
+            if rf is None or rp is None or rf >= flow - 0.001:
+                continue
+            # highest lower flow wins; on a tie the most recent one
+            if ref is None or rf >= ref[0]:
+                ref = (rf, rp)
+        if ref is None:
+            return None
+        ref_flow, ref_pwm = ref
+        drop = ref_pwm - pwm
+        if drop < p.PWM_COLLAPSE_MIN_ABS:
+            return None
+        if pwm >= ref_pwm * (1.0 - p.PWM_COLLAPSE_FRAC):
+            return None
+        return ("heater duty fell to %.0f %% at %.1f mm³/s from %.0f %% "
+                "at %.1f mm³/s — more flow was commanded but less heat "
+                "is being absorbed, so filament stopped arriving "
+                "(stall, grind or clog)"
+                % (pwm * 100, flow, ref_pwm * 100, ref_flow))
 
     def _check_thermal_runaway(self, results):
         """Detect that the extruder stopped delivering the commanded flow.
@@ -5870,7 +6452,10 @@ new Chart(document.getElementById('cvChart'), {
     def cmd_TMC_FLOW_FIND_MAX(self, gcmd):
         """Run the StallGuard-based flow test."""
         self._lookup_tmc()
-        self._run_find_max(gcmd)
+        try:
+            self._run_find_max(gcmd)
+        except _HardStop:
+            pass  # already reported and cleaned up
 
     def _run_find_max(self, gcmd):
         """Common bracket-bisection algorithm using SG triggers."""
@@ -5898,6 +6483,22 @@ new Chart(document.getElementById('cvChart'), {
             'COLD_EXTRUSION_HINT', 0.0, minval=0., maxval=200.)
         ref_flow = gcmd.get_float('REF_FLOW', self.reference_flow,
                                   minval=0.)
+        # Data-collection additions (recorded only, no triggers):
+        #   TEMP=<°C>     heat the hotend and wait (0 = use current target)
+        #   SETTLE=<s>    hold temperature this long before each idle
+        #                 baseline so the PID output is steady
+        #   IDLE=<s>      idle heater-duty baseline length, measured at
+        #                 the start and again at the end (0 = off)
+        #   BDWIDTH=<name|auto|none>  bdwidth sensor for motion data
+        test_temp = gcmd.get_float('TEMP', 0.0, minval=0., maxval=400.)
+        settle_s = gcmd.get_float('SETTLE', 20.0, minval=0., maxval=900.)
+        idle_s = gcmd.get_float('IDLE', 60.0, minval=0., maxval=600.)
+        bdw_param = gcmd.get('BDWIDTH', 'auto').strip()
+        #   BDW_MIN_RATIO=<0..1>  fail a step when BDWidth saw less than
+        #                 this fraction of the expected filament feed
+        #                 (scale-corrected); 0 = record only, no trigger
+        self._bdw_min_ratio = gcmd.get_float(
+            'BDW_MIN_RATIO', 0.6, minval=0., maxval=0.95)
 
         # Part-cooling fan speed for the test. Defaults to the value
         # in [tmc_flow_test] config (or 0 if not set). Override per
@@ -5927,6 +6528,23 @@ new Chart(document.getElementById('cvChart'), {
             gcmd.respond_info("TMC configuration check passed.")
             for info in infos:
                 gcmd.respond_info(info)
+
+        # ─── Hotend heat-up (TEMP=) ───
+        if test_temp > 0:
+            if test_temp < self.min_hotend_temp:
+                raise gcmd.error(
+                    "TEMP=%.0f is below min_hotend_temp (%.0f)."
+                    % (test_temp, self.min_hotend_temp))
+            gcmd.respond_info(
+                "Heating hotend to %.1f°C and waiting..." % test_temp)
+            # Not M109: macro sets (e.g. Demon) often override it with a
+            # loose window (target-7), which then fails the "within 5°C"
+            # check below. Wait to within 1°C with stock commands.
+            self.gcode.run_script_from_command(
+                "SET_HEATER_TEMPERATURE HEATER=extruder TARGET=%.1f\n"
+                "TEMPERATURE_WAIT SENSOR=extruder MINIMUM=%.1f "
+                "MAXIMUM=%.1f"
+                % (test_temp, test_temp - 1.0, test_temp + 5.0))
 
         # ─── Hotend temp check ───
         extruder = self.printer.lookup_object('extruder')
@@ -6048,16 +6666,62 @@ new Chart(document.getElementById('cvChart'), {
                 "flexibility during a max-flow test."
                 % (fan_speed_pct, original_fan_pct))
 
+        # ─── BDWidth motion sensor (data only) ───
+        bdw = self._resolve_bdwidth(gcmd, bdw_param)
+        if bdw is not None:
+            self._bdwidth_prepare(gcmd, bdw)
+            meta['bdwidth'] = ('%s (test mode=%s, was %s, %.1f counts/mm, '
+                               'sample %.1f s)' % (
+                                   bdw['name'], bdw['mode'],
+                                   bdw['orig_mode'], bdw['counts_per_mm'],
+                                   bdw['sample_time']))
+        else:
+            meta['bdwidth'] = 'not used'
+
+        # ─── Idle heater baseline (start) ───
+        # Fan is already locked, so the idle losses match the test.
+        if idle_s > 0:
+            ib = self._measure_idle_baseline(gcmd, settle_s, idle_s,
+                                             'start')
+            if ib:
+                meta['idle_pwm_start'] = round(ib['pwm'], 4)
+                meta['idle_temp_start'] = round(ib['temp'], 2)
+        t0 = self.reactor.monotonic()
+        meta['idle_settle_s'] = settle_s
+        meta['idle_measure_s'] = idle_s
+
         if purge > 0:
             self.gcode.run_script_from_command(
                 "M83\nG1 E%.2f F300\nG92 E0" % purge)
         self.gcode.run_script_from_command("M83\nG92 E0")
 
         results = []
+        trigger_events_ref = []   # same list object as trigger_events
+
+        def measure_annotated(flow, reps):
+            """_measure_step plus the data-only extras: time since the
+            start baseline (for idle-drift correction) and BDWidth
+            measured filament motion."""
+            bdw_before = (self._bdwidth_total(bdw)
+                          if bdw is not None else None)
+            r = self._measure_step(
+                gcmd, flow, step_duration, reps)
+            r['t_s'] = self.reactor.monotonic() - t0
+            if bdw is not None:
+                bdw_after = self._bdwidth_total(bdw)
+                cmd_mm = (flow / self.filament_area) * step_duration \
+                    * reps
+                r['bdw'] = self._bdwidth_step(
+                    bdw, bdw_before, bdw_after, cmd_mm)
+                b = r['bdw']
+                if b.get('meas_mm') is not None:
+                    gcmd.respond_info(
+                        "    BDWidth: %.1f of %.1f mm commanded (%.1f %%)"
+                        % (b['meas_mm'], b['cmd_mm'], b['ratio'] * 100))
+            return r
 
         def measure_and_save(flow, phase):
-            r = self._measure_step(
-                gcmd, flow, step_duration, repeat)
+            r = measure_annotated(flow, repeat)
             r['phase'] = phase
             results.append(r)
             self._save_report(
@@ -6066,8 +6730,136 @@ new Chart(document.getElementById('cvChart'), {
             return r
 
         def check(results):
-            """SG-based slip detection."""
-            return self._check_triggers_sg(results)
+            """SG-based slip detection. A HARD failure (filament stopped)
+            ends the run here instead of returning to the bisection."""
+            reason = self._check_triggers_sg(results)
+            if reason and getattr(self, '_hard_failure', None):
+                results[-1]['hard_fail'] = True
+                hard_stop(reason)
+            return reason
+
+        def hard_stop(reason):
+            cur = results[-1]['flow'] if results else 0.0
+            # Steps that passed: lower flow AND not themselves a hard
+            # failure (a jam can sit through several reference steps).
+            good = [r['flow'] for r in results[:-1]
+                    if r['flow'] < cur - 0.001
+                    and not r.get('hard_fail')]
+            last_good = max(good) if good else None
+            trigger_events_ref.append({
+                'phase': results[-1].get('phase', 'coarse') if results
+                else 'coarse',
+                'flow': cur, 'kind': 'trigger', 'reason': reason,
+                'cv': None, 'iqr': None, 'sg_median': None})
+            gcmd.respond_info(
+                "\n  >>> FILAMENT FAILURE at %.1f mm³/s — %s\n"
+                "      Stopping the test: the filament is stripped, "
+                "stalled or clogged, so further steps would only grind "
+                "it. Reload or trim the filament before the next run."
+                % (cur, reason))
+            if last_good is None:
+                final = None
+            else:
+                final = {
+                    'max_safe': last_good,
+                    'verify_cv': 0.0,
+                    'quality': 'stopped on filament failure',
+                    'stop_reason': reason,
+                    'trigger_events': list(trigger_events_ref),
+                    'baseline_stats': self._coarse_baseline_stats(results),
+                }
+            # Save and restore everything BEFORE the end-of-run idle
+            # baseline, so cancelling during that wait loses nothing.
+            self._save_report(results, meta, timestamp, reason,
+                              no_html, gcmd=None, announce=False,
+                              final_result=final)
+            self.gcode.run_script_from_command("G92 E0")
+            self._restore_sgt_if_needed(gcmd, original_sgt, final_sgt,
+                                         keep_sgt, save_sgt=save_sgt)
+            try:
+                self._set_part_cooling_fan(original_fan_pct, gcmd,
+                                           quiet=True)
+            except Exception:
+                pass
+            if idle_s > 0:
+                gcmd.respond_info(
+                    "  Report saved. Measuring the end-of-run idle "
+                    "baseline (~%.0f s, no extrusion) for drift "
+                    "correction and the melt limit — safe to cancel, "
+                    "you only lose those two extras."
+                    % (settle_s + idle_s))
+            finish_idle()
+            if last_good is None:
+                gcmd.respond_info(
+                    "The filament was not moving from the first step on "
+                    "(%.1f mm³/s) — this is a jam or clog, not a flow "
+                    "limit. Clear it (cold pull / trim the chewed "
+                    "filament) before re-running." % cur)
+            else:
+                gcmd.respond_info(
+                    "\n========== FINAL RESULT ==========\n"
+                    "Last step before the filament failure: %.1f mm³/s\n"
+                    "(mechanical limit — the extruder could not push "
+                    "%.1f)\n"
+                    "----------------------------------\n"
+                    "Slicer recommendation:\n"
+                    "  Conservative (80%%): %.1f mm³/s\n"
+                    "  Aggressive (90%%):   %.1f mm³/s\n"
+                    "  See the melt-limit line above for print quality.\n"
+                    "=================================="
+                    % (last_good, cur, last_good * 0.8, last_good * 0.9))
+            self._save_report(results, meta, timestamp, reason,
+                              no_html, gcmd=gcmd, final_result=final)
+            raise _HardStop(reason)
+
+        def finish_idle():
+            """Idle heater baseline at the end of the run, so the CSV
+            can correct for drift (chamber warm-up) between start and
+            end. Recorded only; never affects the result. Also puts the
+            BDWidth sensor back in its original mode."""
+            if bdw is not None:
+                self._bdwidth_restore(gcmd, bdw)
+            if idle_s <= 0:
+                return
+            try:
+                ib_end = self._measure_idle_baseline(
+                    gcmd, settle_s, idle_s, 'end')
+            except Exception as e:
+                gcmd.respond_info("  Idle baseline (end) skipped: %s"
+                                  % (e,))
+                return
+            if ib_end:
+                meta['idle_pwm_end'] = round(ib_end['pwm'], 4)
+                meta['idle_temp_end'] = round(ib_end['temp'], 2)
+                meta['idle_t_end_s'] = round(
+                    ib_end['t_mid'] - t0, 1)
+            report_melt_knee()
+
+        def report_melt_knee():
+            knee = self._melt_knee(results, meta)
+            if knee is None:
+                return
+            meta['melt_fit_intercept'] = round(knee['intercept'], 4)
+            meta['melt_fit_slope'] = round(knee['slope'], 6)
+            if knee.get('warn'):
+                meta['melt_fit_warning'] = knee['warn']
+                gcmd.respond_info("  Melt-limit note: %s" % knee['warn'])
+            if knee['knee'] is None:
+                meta['melt_limit'] = ('heat per mm³ stayed above %.0f %% '
+                                      'of the low-flow line up to '
+                                      '%.1f mm³/s'
+                                      % (knee['frac'] * 100,
+                                         knee['max_tested']))
+            else:
+                meta['melt_limit'] = ('%s (heat per mm³ fell to '
+                                      '%.0f %% of the low-flow line at '
+                                      '%.1f mm³/s)'
+                                      % ('%.1f mm³/s' % knee['last_ok']
+                                         if knee['last_ok'] else 'n/a',
+                                         knee['knee_ratio'] * 100,
+                                         knee['knee']))
+            gcmd.respond_info("\nMelt limit (print quality, report "
+                              "only): %s" % meta['melt_limit'])
 
         # ─── PHASE 0: Reference (baseline) ───
         # Two fixed low-flow steps far below any realistic limit.
@@ -6084,6 +6876,9 @@ new Chart(document.getElementById('cvChart'), {
                    start_flow))
             for rf in ref_flows:
                 measure_and_save(rf, 'ref')
+                # Only the hard checks (filament stopped) act here; the
+                # SG checks need the sweep history and are ignored.
+                check(results)
                 self.gcode.run_script_from_command("G4 P500")
 
         # ─── PHASE 1: Coarse ───
@@ -6101,7 +6896,7 @@ new Chart(document.getElementById('cvChart'), {
         # 'phase', 'flow', 'kind' (one of: 'trigger', 'borderline-retest',
         # 'borderline-confirmed', 'verify-fail', 'verify-borderline'),
         # 'reason', 'cv', 'iqr', 'sg_median'.
-        trigger_events = []
+        trigger_events = trigger_events_ref
 
         def _record_event(phase, flow, kind, reason, last_result=None):
             ev = {'phase': phase, 'flow': flow,
@@ -6147,6 +6942,7 @@ new Chart(document.getElementById('cvChart'), {
             gcmd.respond_info(
                 "Reached MAX %.1f mm³/s without trigger. Try MAX higher."
                 % max_flow)
+            finish_idle()
             self._save_report(results, meta, timestamp, None,
                               no_html, gcmd=gcmd)
             self._restore_sgt_if_needed(gcmd, original_sgt, final_sgt,
@@ -6157,6 +6953,7 @@ new Chart(document.getElementById('cvChart'), {
         if low < sweep_floor:
             gcmd.respond_info(
                 "Trigger fired on first step (%.1f) — lower START." % high)
+            finish_idle()
             self._save_report(results, meta, timestamp, first_trigger_reason,
                               no_html, gcmd=gcmd)
             self._restore_sgt_if_needed(gcmd, original_sgt, final_sgt,
@@ -6281,9 +7078,7 @@ new Chart(document.getElementById('cvChart'), {
                 "\n>>> Phase 3: Verification at %.1f mm³/s <<<\n"
                 "  Confirming with %d repetitions."
                 % (low, verify_repeats))
-            verify_result = self._measure_step(
-                gcmd, low, step_duration, verify_repeats,
-                )
+            verify_result = measure_annotated(low, verify_repeats)
             verify_result['phase'] = 'verify'
             results.append(verify_result)
 
@@ -6305,9 +7100,7 @@ new Chart(document.getElementById('cvChart'), {
                         self.gcode.run_script_from_command(
                             "G4 P%d" % int(cooldown * 1000))
                     results.pop()
-                    verify_result = self._measure_step(
-                        gcmd, low, step_duration, verify_repeats,
-                        )
+                    verify_result = measure_annotated(low, verify_repeats)
                     verify_result['phase'] = 'verify'
                     results.append(verify_result)
                     verify_trigger = check(results)
@@ -6363,9 +7156,7 @@ new Chart(document.getElementById('cvChart'), {
                     "\n>>> Phase 3: Final verification at %.1f mm³/s "
                     "<<<\n  Confirming with %d repetitions."
                     % (low, verify_repeats))
-                verify_result = self._measure_step(
-                    gcmd, low, step_duration, verify_repeats,
-                    )
+                verify_result = measure_annotated(low, verify_repeats)
                 verify_result['phase'] = 'verify'
                 results.append(verify_result)
                 break
@@ -6414,9 +7205,7 @@ new Chart(document.getElementById('cvChart'), {
                     "\n>>> Phase 3: Final verification at %.1f mm³/s "
                     "<<<\n  Confirming with %d repetitions."
                     % (low, verify_repeats))
-                verify_result = self._measure_step(
-                    gcmd, low, step_duration, verify_repeats,
-                    )
+                verify_result = measure_annotated(low, verify_repeats)
                 verify_result['phase'] = 'verify'
                 results.append(verify_result)
                 break
@@ -6448,6 +7237,7 @@ new Chart(document.getElementById('cvChart'), {
             % (max_safe, quality, verify_cv,
                max_safe * 0.8, max_safe * 0.9))
 
+        finish_idle()
         self._save_report(results, meta, timestamp, last_trigger_reason,
                           no_html, gcmd=gcmd,
                           final_result={
