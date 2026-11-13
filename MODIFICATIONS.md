@@ -43,7 +43,18 @@ Both options are listed (commented out) in `speed_test_settings.cfg`.
 
 ### Why
 
-On a geared extruder with plenty of torque, StallGuard's SG_RESULT
+> **These flow-test changes were made because StallGuard would not
+> measure or trigger appropriately on my setup:** a TMC5160 driving the
+> extruder with a **0.05 Ω sense resistor**. That resistor is sized for
+> high-current motors, so at extruder currents (~0.8 A) the driver works
+> in a small part of its current-sense range and StallGuard has little
+> resolution. With a sense resistor sized for extruder currents, the
+> stock StallGuard detection would most likely work and these changes
+> would probably not be needed. They are still useful as an independent
+> cross-check, but treat them as a workaround for this kind of driver
+> setup, not a replacement for a correctly sized driver.
+
+On my geared extruder with plenty of torque, StallGuard's SG_RESULT
 mostly tracks extrusion **speed** (SG × flow stayed constant within a
 few % across every run), not load. The stock SG triggers missed real
 stalls and strips, and the plateau trigger fired on the normal shape of
