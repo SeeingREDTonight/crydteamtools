@@ -68,7 +68,7 @@ StallGuard readback (TMC2130/2209/2240/5160/2660 — see the
 cd ~/crydteamtools && ./install.sh pa_test
 ```
 
-Then uncomment `[pa_test]` in `pa_test_settings.cfg` and
+Then uncomment `[sg_pa_test]` in `pa_test_settings.cfg` and
 `FIRMWARE_RESTART`.
 
 ## Roadmap
@@ -82,3 +82,14 @@ Then uncomment `[pa_test]` in `pa_test_settings.cfg` and
 ---
 
 Released under the GNU General Public License v3.0.
+
+## Section name
+
+The module installs as `sg_pa_test.py` with the config section
+`[sg_pa_test]`. Earlier versions used `pa_test.py` / `[pa_test]`, which
+replaced the firmware's own PA tower module (`PRINT_PA_TOWER`) in
+Klipper and Kalico. Re-running `./install.sh pa_test` migrates an old
+install: it removes the old symlink, restores the firmware's
+`klippy/extras/pa_test.py` from git, and renames the section in
+`pa_test_settings.cfg`.
+

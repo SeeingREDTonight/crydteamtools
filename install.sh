@@ -53,7 +53,7 @@ plugin_files() {
         speed_test)    echo "speed_test/speed_test.py" ;;
         max_flow_test) echo "max_flow_test/tmc_flow_test.py" ;;
         motor_sync)    echo "motor_sync/motor_sync.py" ;;
-        pa_test)       echo "pa_test/pa_test.py" ;;
+        pa_test)       echo "pa_test/sg_pa_test.py" ;;
         chopper_test)  echo "chopper_test/chopper_test.py" ;;
     esac
 }
@@ -165,6 +165,38 @@ link() {   # link <src> <dst>
     ln -s "$1" "$2"
 }
 
+# ── pa_test → sg_pa_test migration ──
+# Older versions installed the StallGuard PA probe as extras/pa_test.py.
+# That name belongs to Klipper/Kalico's own PA tower module
+# (PRINT_PA_TOWER), so the symlink replaced it and both tools fought
+# over the [pa_test] config section. The probe is now sg_pa_test.py
+# with its own [sg_pa_test] section. This undoes the old install:
+# drops our pa_test.py symlink, restores the firmware's own file from
+# git when it tracks one, and renames the section header in the copied
+# settings file.
+migrate_pa_test_name() {
+    old="${KLIPPER_EXTRAS}/pa_test.py"
+    if [ -L "$old" ]; then
+        target="$(readlink -f "$old" 2>/dev/null || true)"
+        case "$target" in
+            "${REPO_DIR}"/*|*/crydteamtools/*)
+                rm -f "$old"
+                echo "  ✓ removed old pa_test.py symlink from extras"
+                klipper_dir="$(cd "${KLIPPER_EXTRAS}/../.." && pwd)"
+                if git -C "$klipper_dir" ls-files --error-unmatch klippy/extras/pa_test.py >/dev/null 2>&1; then
+                    git -C "$klipper_dir" checkout -- klippy/extras/pa_test.py \
+                        && echo "  ✓ restored the firmware's own klippy/extras/pa_test.py (PRINT_PA_TOWER)"
+                fi
+                ;;
+        esac
+    fi
+    st="${CONFIG_DIR}/pa_test_settings.cfg"
+    if [ -f "$st" ] && grep -Eq '^[[:space:]#]*\[pa_test\]' "$st"; then
+        sed -i -E 's/^([[:space:]#]*)\[pa_test\]/\1[sg_pa_test]/' "$st"
+        echo "  ✓ pa_test_settings.cfg: section renamed to [sg_pa_test]"
+    fi
+}
+
 # True if "[include <file>]" already exists ANYWHERE in the config
 # dir — printer.cfg or any sub-config (users often keep their includes
 # in a separate file). Tolerates extra whitespace, ignores commented
@@ -231,6 +263,7 @@ if [ "$MODE" = "uninstall" ]; then
     echo ""
     for id in "${SELECTED[@]}"; do
         echo "── removing $id ──"
+        [ "$id" = "pa_test" ] && migrate_pa_test_name
         for rel in $(plugin_files "$id"); do
             dst="${KLIPPER_EXTRAS}/$(basename "$rel")"
             if [ -L "$dst" ] || [ -f "$dst" ]; then
@@ -304,7 +337,8 @@ ALREADY=()
 for id in "${SELECTED[@]}"; do
     for rel in $(plugin_files "$id"); do
         if [ -L "${KLIPPER_EXTRAS}/$(basename "$rel")" ] \
-           || [ -f "${KLIPPER_EXTRAS}/$(basename "$rel")" ]; then
+           || [ -f "${KLIPPER_EXTRAS}/$(basename "$rel")" ] \
+           || { [ "$id" = "pa_test" ] && [ -L "${KLIPPER_EXTRAS}/pa_test.py" ]; }; then
             ALREADY+=("$id")
             break
         fi
@@ -342,6 +376,7 @@ fi
 echo ""
 for id in "${SELECTED[@]}"; do
     echo "── $id ──"
+    [ "$id" = "pa_test" ] && migrate_pa_test_name
     for rel in $(plugin_files "$id"); do
         src="${REPO_DIR}/${rel}"
         dst="${KLIPPER_EXTRAS}/$(basename "$rel")"
@@ -456,7 +491,7 @@ for id in "${SELECTED[@]}"; do
         motor_sync)
             echo "  motor_sync:    uncomment [motor_sync] in motor_sync_settings.cfg" ;;
         pa_test)
-            echo "  pa_test:       uncomment [pa_test] in pa_test_settings.cfg" ;;
+            echo "  pa_test:       uncomment [sg_pa_test] in pa_test_settings.cfg" ;;
         chopper_test)
             echo "  chopper_test:  uncomment [chopper_test] in chopper_test_settings.cfg" ;;
     esac
