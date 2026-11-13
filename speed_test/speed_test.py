@@ -64,6 +64,15 @@ class SpeedTest:
         # Skip tolerance in FULL steps across a re-home (~1 step of homing
         # jitter is normal; real stalls lose far more).
         self.max_missed = config.getfloat('max_missed', 1.5, above=0.)
+        # Z-axis tests (SPEED_TEST_FIND_MAX_VELOCITY / _ACCEL AXIS=Z only):
+        # lowest Z the test may move to (keeps the nozzle/probe well away
+        # from the bed if the gantry slips) and the levelling command run
+        # after every Z re-home ('auto' = QUAD_GANTRY_LEVEL or
+        # Z_TILT_ADJUST when configured, 'none' = skip).
+        self.z_test_min = config.getfloat('z_test_min', 30.0, minval=0.)
+        self.z_level_gcode = config.get('z_level_gcode', 'auto').strip()
+        self._z_test = False
+        self._z_orig_limits = None
         # Testbench mode: only X-stepper connected, no Y, no Z. Skips all
         # Y/Z homing and ignores Y in skip checks and TMC monitoring.
         # Per-command TESTBENCH=1/0 override is honored.
@@ -176,6 +185,12 @@ class SpeedTest:
         margin = min(self.margin, 0.1 * (ax_max - ax_min))
         ax_min += margin
         ax_max -= margin
+        if axis.upper() == 'Z':
+            ax_min = max(ax_min, self.z_test_min)
+            if ax_max - ax_min < 20.0:
+                raise self.gcode.error(
+                    "speed_test: usable Z travel %.1f–%.1f mm is too short "
+                    "(z_test_min / margin)." % (ax_min, ax_max))
         return ax_min, ax_max, (ax_min + ax_max) / 2.0, ax_max - ax_min
 
     def _homes_to_max(self, axis):
@@ -228,10 +243,38 @@ class SpeedTest:
         if parts:
             self.gcode.run_script_from_command(
                 "SET_VELOCITY_LIMIT " + " ".join(parts))
+        if self._z_test:
+            # Z moves are also capped by max_z_velocity / max_z_accel,
+            # which have no G-code; set them alongside the toolhead
+            # limits for the duration of a Z test.
+            kin = self.printer.lookup_object('toolhead').get_kinematics()
+            if velocity is not None:
+                kin.max_z_velocity = velocity
+            if accel is not None:
+                kin.max_z_accel = accel
+
+    def _begin_z_test(self, enable):
+        """Enter/leave Z-test mode; remembers and restores the
+        kinematics' max_z_velocity / max_z_accel."""
+        kin = self.printer.lookup_object('toolhead').get_kinematics()
+        if self._z_orig_limits is not None:
+            kin.max_z_velocity, kin.max_z_accel = self._z_orig_limits
+            self._z_orig_limits = None
+        self._z_test = bool(enable)
+        if enable:
+            if not all(hasattr(kin, a) for a in ('max_z_velocity',
+                                                 'max_z_accel')):
+                self._z_test = False
+                raise self.gcode.error(
+                    "speed_test: these kinematics have no max_z_velocity /"
+                    " max_z_accel — Z tests are not supported here.")
+            self._z_orig_limits = (kin.max_z_velocity, kin.max_z_accel)
 
     def _restore_limits(self):
         v, a, scv = self._get_printer_limits()
         self._set_limits(velocity=v, accel=a, scv=scv)
+        if self._z_test or self._z_orig_limits is not None:
+            self._begin_z_test(False)
 
     def _apply_limits_checked(self, gcmd, velocity, accel):
         """Set the motion limits and VERIFY they were accepted.
@@ -258,10 +301,46 @@ class SpeedTest:
 
     # ─── Homing & skip detection ──────────────────────────────────────
 
+    def _z_level_cmd(self):
+        cfg = self.z_level_gcode
+        if cfg.lower() in ('none', 'off', ''):
+            return None
+        if cfg.lower() != 'auto':
+            return cfg
+        if self.printer.lookup_object('quad_gantry_level', None) is not None:
+            return 'QUAD_GANTRY_LEVEL'
+        if self.printer.lookup_object('z_tilt', None) is not None:
+            return 'Z_TILT_ADJUST'
+        return None
+
+    def _z_stepper_axes(self):
+        """('Z', 'Z1', 'Z2', 'Z3' …) for every stepper_z* motor."""
+        try:
+            kin = self.printer.lookup_object('toolhead').get_kinematics()
+            names = sorted(s.get_name() for s in kin.get_steppers()
+                           if s.get_name().startswith('stepper_z'))
+        except Exception:
+            names = ['stepper_z']
+        return tuple(n[len('stepper_'):].upper() for n in names) or ('Z',)
+
     def _ensure_homed(self, axes, testbench=False):
         toolhead = self.printer.lookup_object('toolhead')
         homed = toolhead.get_status(
             self.reactor.monotonic()).get('homed_axes', '')
+
+        if self._z_test:
+            # Z reference = home Z, level the gantry/bed, home Z again.
+            # Levelling after every step is what makes a single slipped
+            # Z motor visible: it gets corrected individually, so its
+            # step count drifts away from the others' baseline.
+            if 'x' not in homed or 'y' not in homed:
+                self.gcode.run_script_from_command("G28 X Y")
+            self.gcode.run_script_from_command("G28 Z")
+            lvl = self._z_level_cmd()
+            if lvl:
+                self.gcode.run_script_from_command(lvl)
+                self.gcode.run_script_from_command("G28 Z")
+            return
 
         if testbench:
             # Only home X — no Y, no Z. Useful for bench setups with a
@@ -436,6 +515,18 @@ class SpeedTest:
         if testbench:
             self.gcode.run_script_from_command(
                 "G1 %s%.3f F%.1f" % (axis, pos, feed))
+        elif axis == 'Z':
+            # Z first (straight up from the homing position), then hold
+            # X/Y at park_x/park_y or the bed centre.
+            self.gcode.run_script_from_command(
+                "G1 Z%.3f F%.1f" % (pos, feed))
+            xs = []
+            for ax, park in (('X', self.park_x), ('Y', self.park_y)):
+                if park is None:
+                    park = self._get_axis_bounds(ax)[2]
+                xs.append("%s%.3f" % (ax, park))
+            self.gcode.run_script_from_command(
+                "G1 %s F%.1f" % (" ".join(xs), feed))
         else:
             other, opos = (('X', self.park_x) if axis == 'Y'
                            else ('Y', self.park_y))
@@ -732,6 +823,8 @@ class SpeedTest:
         self._last_cruise_fraction = cruise_fraction
         if testbench:
             sample_axes = ('X',)
+        elif self._z_test:
+            sample_axes = self._z_stepper_axes()
         elif self.structure == 'corexy':
             sample_axes = ('X', 'Y')
         else:
@@ -757,7 +850,7 @@ class SpeedTest:
         tmc_stats = {ax: self._tmc_stats(ax) for ax in sample_axes}
 
         failed = bool(skips)
-        if failed and not testbench:
+        if failed and not testbench and not self._z_test:
             self._resync_after_skip(gcmd)
         max_diff = max((d for _, d in skips), default=0)
         skip_axes = ",".join(a for a, _ in skips)
@@ -1055,7 +1148,8 @@ class SpeedTest:
     # ─── Commands ─────────────────────────────────────────────────────
 
     def _parse_testbench_axis(self, gcmd,
-                              tb_note=" (single stepper wired to X)."):
+                              tb_note=" (single stepper wired to X).",
+                              allow_z=False):
         """Shared prologue for the per-axis commands: resolve TESTBENCH and
         AXIS, and validate (testbench ⇒ X only; axis ∈ {X, Y}). `tb_note`
         tailors the testbench error message per command."""
@@ -1063,18 +1157,52 @@ class SpeedTest:
             'TESTBENCH', 1 if self.testbench_default else 0,
             minval=0, maxval=1))
         axis = gcmd.get('AXIS', self.default_axis).upper()
+        # Leave any earlier Z test cleanly before validating this one.
+        self._begin_z_test(False)
         if testbench and axis != 'X':
             raise gcmd.error("Testbench mode supports AXIS=X only" + tb_note)
+        if axis == 'Z':
+            if not allow_z:
+                raise gcmd.error(
+                    "AXIS=Z is only supported by SPEED_TEST_FIND_MAX_VELOCITY"
+                    " and SPEED_TEST_FIND_MAX_ACCEL.")
+            self._begin_z_test(True)
+            gcmd.respond_info(
+                "!! Z test: UNTESTED on real hardware — use at your own "
+                "risk. Watch the first run with a hand on the emergency "
+                "stop and start with a low MAX.")
+            gcmd.respond_info(
+                "Z test: moves between Z=%.0f and the top of travel, "
+                "re-homes Z%s after every step. A failed step means the "
+                "gantry/bed slipped — it is re-levelled before the next "
+                "one. Stay at the printer with E-stop in reach."
+                % (self.z_test_min,
+                   (" + " + self._z_level_cmd()) if self._z_level_cmd()
+                   else ""))
+            return testbench, axis
         if axis not in ('X', 'Y'):
-            raise gcmd.error("AXIS must be X or Y")
+            raise gcmd.error("AXIS must be X or Y (or Z for "
+                             "FIND_MAX_VELOCITY / FIND_MAX_ACCEL)")
         return testbench, axis
 
     def cmd_FIND_MAX_VELOCITY(self, gcmd):
+        try:
+            self._run_find_max_velocity(gcmd)
+        finally:
+            # Always leave Z-test mode and restore limits, even if
+            # the run aborted before its own cleanup (e.g. a
+            # levelling error after a gantry slip).
+            if self._z_test or self._z_orig_limits is not None:
+                self._restore_limits()
+
+    def _run_find_max_velocity(self, gcmd):
         self._check_ready()
-        testbench, axis = self._parse_testbench_axis(gcmd)
-        min_v = gcmd.get_float('MIN', 50.0, above=0.)
-        max_v = gcmd.get_float('MAX', 500.0, above=min_v)
-        coarse = gcmd.get_float('COARSE_STEP', 25.0, above=0.)
+        testbench, axis = self._parse_testbench_axis(gcmd, allow_z=True)
+        zd = (axis == 'Z')
+        min_v = gcmd.get_float('MIN', 20.0 if zd else 50.0, above=0.)
+        max_v = gcmd.get_float('MAX', 300.0 if zd else 500.0, above=min_v)
+        coarse = gcmd.get_float('COARSE_STEP', 20.0 if zd else 25.0,
+                                above=0.)
         min_step = gcmd.get_float('MIN_STEP', 5.0, above=0.)
         # ACCEL=0 (default) → auto-compute from MAX_V and axis range so
         # that at least CRUISE_RATIO of the move is spent at MAX velocity.
@@ -1173,13 +1301,27 @@ class SpeedTest:
                           no_html, 'velocity', gcmd)
 
     def cmd_FIND_MAX_ACCEL(self, gcmd):
+        try:
+            self._run_find_max_accel(gcmd)
+        finally:
+            # Always leave Z-test mode and restore limits, even if
+            # the run aborted before its own cleanup (e.g. a
+            # levelling error after a gantry slip).
+            if self._z_test or self._z_orig_limits is not None:
+                self._restore_limits()
+
+    def _run_find_max_accel(self, gcmd):
         self._check_ready()
-        testbench, axis = self._parse_testbench_axis(gcmd)
+        testbench, axis = self._parse_testbench_axis(gcmd, allow_z=True)
+        zd = (axis == 'Z')
         min_a = gcmd.get_float('MIN', 500.0, above=0.)
-        max_a = gcmd.get_float('MAX', 50000.0, above=min_a)
-        coarse = gcmd.get_float('COARSE_STEP', 2500.0, above=0.)
-        min_step = gcmd.get_float('MIN_STEP', 250.0, above=0.)
-        speed = gcmd.get_float('SPEED', 200.0, above=0.)
+        max_a = gcmd.get_float('MAX', 20000.0 if zd else 50000.0,
+                               above=min_a)
+        coarse = gcmd.get_float('COARSE_STEP', 1000.0 if zd else 2500.0,
+                                above=0.)
+        min_step = gcmd.get_float('MIN_STEP', 100.0 if zd else 250.0,
+                                  above=0.)
+        speed = gcmd.get_float('SPEED', 100.0 if zd else 200.0, above=0.)
         repeat = gcmd.get_int('REPEAT', 30, minval=1, maxval=200)
         verify_repeats = gcmd.get_int('VERIFY_REPEATS', 50, minval=1, maxval=300)
         max_bisect = gcmd.get_int('MAX_BISECT_STEPS', 6, minval=2, maxval=15)

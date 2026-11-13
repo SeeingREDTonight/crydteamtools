@@ -35,7 +35,7 @@ the plugin loaded and your axes are recognised.
 
 ### Options added in this fork
 
-Both are listed, commented out with descriptions, in the template
+All are listed, commented out with descriptions, in the template
 `speed_test_settings.cfg`. Existing installs keep their own settings file
 (in `crydteamtools/` in your config folder) — copy in the lines you want.
 
@@ -58,7 +58,30 @@ park_x: 175
 #   anything else is run as G-code, e.g.
 #   skip_resync_gcode: SYNC_MOTORS AXES=x,y RETRIES=5
 #skip_resync_gcode: auto
+
+# Z-axis tests (SPEED_TEST_FIND_MAX_VELOCITY / FIND_MAX_ACCEL with AXIS=Z
+# only; never part of the automatic sweeps). Lowest Z the test may move
+# to, so a slipping gantry or bed stays clear of the nozzle.
+#z_test_min: 30
+# Levelling after every Z re-home: auto = QUAD_GANTRY_LEVEL or
+# Z_TILT_ADJUST if configured, none = skip, or any G-code.
+#z_level_gcode: auto
 ```
+
+> **Untested, at your own risk.** The Z tests have only been run
+> against a simulated printer, never on real hardware. Watch the first
+> run with a hand on the emergency stop and start with a low `MAX`.
+
+Z tests are run by hand, e.g.:
+
+```
+SPEED_TEST_FIND_MAX_VELOCITY AXIS=Z
+SPEED_TEST_FIND_MAX_ACCEL AXIS=Z SPEED=100
+```
+
+Every Z motor is compared after each step, so one slipped corner counts
+as a failure. Start low — a failed Z step means the gantry slipped under
+load.
 
 Neither option needs anything on the command line: every test
 (`SPEED_TEST_FIND_LIMITS`, `…_FIND_MAX_VELOCITY`, `…_FIND_MAX_ACCEL`, …)

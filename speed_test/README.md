@@ -25,13 +25,21 @@ It pushes a motor until it loses steps, then narrows in on the safe limit with a
 >   (StallGuard, this suite) if enabled, else prints a note that the
 >   motors may now be out of sync. `none` = off; any other value is run
 >   as your own G-code.
+> - **Z-axis tests (UNTESTED on real hardware — use at your own
+>   risk)** — `SPEED_TEST_FIND_MAX_VELOCITY AXIS=Z` and
+>   `SPEED_TEST_FIND_MAX_ACCEL AXIS=Z` (never part of the automatic
+>   sweeps). Raises the Z limits for the test and restores them, stays
+>   above `z_test_min` (30 mm), and after every step re-homes, levels
+>   (QGL / Z tilt, `z_level_gcode`) and compares every Z motor, so one
+>   slipped corner is caught. A failed Z step means the gantry slipped
+>   under load — start low.
 >
 > - **`start_offset` follows the endstop.** The fast probe starts
 >   `start_offset` from the end the axis homes to. Stock measured it
 >   from position_min, so on max-homing machines every step ran at the
 >   far end and crossed the bed to re-home.
 >
-> Both options are listed (commented out) in `speed_test_settings.cfg`.
+> These options are listed (commented out) in `speed_test_settings.cfg`.
 > Existing installs keep their settings file, so copy the lines you
 > want from the template in this folder. Usage and examples:
 > [docs/configuration.md](docs/configuration.md#options-added-in-this-fork).
