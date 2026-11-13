@@ -24,6 +24,13 @@ PRINTER_CFG="${CONFIG_DIR}/printer.cfg"
 MOONRAKER_CONF="${CONFIG_DIR}/moonraker.conf"
 UPDATER_NAME="crydteamtools"
 GIT_ORIGIN="https://github.com/Fragmon/crydteamtools.git"
+GIT_BRANCH="main"
+# Fork-aware: track the remote and branch this checkout was cloned
+# from, so Moonraker updates come from the fork, not upstream.
+_origin="$(git -C "${REPO_DIR}" remote get-url origin 2>/dev/null || true)"
+[ -n "${_origin}" ] && GIT_ORIGIN="${_origin}"
+_branch="$(git -C "${REPO_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+[ -n "${_branch}" ] && [ "${_branch}" != "HEAD" ] && GIT_BRANCH="${_branch}"
 
 # Re-set the executable bit in case a transfer stripped it.
 chmod +x "$0" 2>/dev/null || true
@@ -405,7 +412,7 @@ if [ -f "${MOONRAKER_CONF}" ]; then
 type: git_repo
 path: ${REPO_DIR}
 origin: ${GIT_ORIGIN}
-primary_branch: main
+primary_branch: ${GIT_BRANCH}
 managed_services: klipper
 EOF
         echo ""

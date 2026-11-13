@@ -6,7 +6,7 @@ commit `062d1dc` (speed_test v1.6.1, TMC Flow Test v1.2.2). Everything
 else is unchanged from upstream. To see every changed line:
 
 ```bash
-git diff 062d1dc -- speed_test max_flow_test
+git diff 062d1dc -- speed_test max_flow_test install.sh
 ```
 
 Developed and tested on an AWD CoreXY (4× TMC5160 on X/Y), Kalico,
@@ -17,6 +17,14 @@ Install exactly like upstream (`./install.sh`). After replacing a
 plugin's `.py` file, restart the Klipper **service**
 (`sudo systemctl restart klipper`) — `FIRMWARE_RESTART` does not reload
 Python code.
+
+---
+
+## Installer (`install.sh`)
+
+Stock writes the upstream URL and branch `main` into Moonraker's update
+manager. Here it uses the clone's own `origin` remote and current
+branch, so Moonraker updates come from this fork and branch.
 
 ---
 
