@@ -45,9 +45,13 @@ class SpeedTest:
         # tested, to clear obstacles near the ends of the X travel.
         self.park_x = config.getfloat('park_x', None)
         self.park_y = config.getfloat('park_y', None)
-        # G-code run after any step that loses steps, to re-sync dual-motor
-        # pairs (e.g. SYNC_MOTORS from MRX8024/motors-sync). Empty = off.
-        self.skip_resync_gcode = config.get('skip_resync_gcode', '').strip()
+        # What to run after a step that loses steps, to re-sync dual-motor
+        # belt pairs: 'auto' (default) picks SYNC_MOTORS (MRX8024
+        # motors-sync, accelerometer) or MOTOR_SYNC (this suite,
+        # StallGuard) when loaded; 'none' turns it off; anything else is
+        # run as literal G-code.
+        self.skip_resync_gcode = config.get(
+            'skip_resync_gcode', 'auto').strip()
         self.z_pos = config.getfloat('z_pos', 20.0, minval=0.)
         self.monitor_tmc = config.getboolean('monitor_tmc', True)
         # Distance from the endstop (start of usable travel) where the jab
@@ -722,7 +726,7 @@ class SpeedTest:
         tmc_stats = {ax: self._tmc_stats(ax) for ax in sample_axes}
 
         failed = bool(skips)
-        if failed and self.skip_resync_gcode and not testbench:
+        if failed and not testbench:
             self._resync_after_skip(gcmd)
         max_diff = max((d for _, d in skips), default=0)
         skip_axes = ",".join(a for a, _ in skips)
@@ -760,18 +764,65 @@ class SpeedTest:
             'tmc': tmc_stats,
         }
 
+    def _dual_motor_axes(self):
+        """Axes (X/Y) whose rail is driven by more than one motor
+        (stepper_x + stepper_x1 …), i.e. AWD / dual-motor belt pairs."""
+        axes = []
+        try:
+            kin = self.printer.lookup_object('toolhead').get_kinematics()
+        except Exception:
+            return axes
+        for rail in getattr(kin, 'rails', []):
+            try:
+                names = [st.get_name() for st in rail.get_steppers()]
+            except Exception:
+                continue
+            for ax in ('x', 'y'):
+                base = 'stepper_' + ax
+                if base in names and sum(
+                        1 for n in names if n.startswith(base)) > 1:
+                    axes.append(ax.upper())
+        return axes
+
+    def _resync_plan(self):
+        """(gcode or None, description) for the post-skip re-sync."""
+        cfg = self.skip_resync_gcode
+        if cfg.lower() in ('none', 'off', 'false', '0'):
+            return None, 'disabled'
+        if cfg and cfg.lower() != 'auto':
+            return cfg, 'configured G-code'
+        axes = self._dual_motor_axes()
+        if not axes:
+            return None, 'single-motor axes'
+        if self.printer.lookup_object('motors_sync', None) is not None:
+            return 'SYNC_MOTORS', 'accelerometer sync (motors_sync)'
+        if self.printer.lookup_object('motor_sync', None) is not None:
+            return ('\n'.join('MOTOR_SYNC AXIS=%s' % a for a in axes),
+                    'StallGuard sync (motor_sync)')
+        return None, 'unavailable'
+
     def _resync_after_skip(self, gcmd):
         """A lost step can leave the two motors of a belt out of phase,
-        and homing does not fix that. Run the configured re-sync G-code
-        at the travel limits (never the test limits that just caused
-        the skip), then force a re-home before the next baseline."""
+        and homing does not fix that. Run the re-sync at the travel
+        limits (never the test limits that just caused the skip), then
+        force a re-home before the next baseline."""
+        script, how = self._resync_plan()
+        if script is None:
+            if how == 'unavailable':
+                gcmd.respond_info(
+                    "  NOTE: lost steps on a dual-motor axis, but no "
+                    "motor sync is available (no [motors_sync] or "
+                    "[motor_sync]) — re-sync skipped. The motors of a "
+                    "belt pair may now be out of sync, so later results "
+                    "can read low. Sync them before relying on this "
+                    "run.")
+            return
         v_lim, a_lim, _scv = self._current_limits()
         self._set_limits(velocity=self.travel_speed,
                          accel=self.travel_accel)
-        gcmd.respond_info("  lost steps -> re-syncing motors: %s"
-                          % self.skip_resync_gcode)
+        gcmd.respond_info("  lost steps -> re-syncing motors (%s)" % how)
         try:
-            self.gcode.run_script_from_command(self.skip_resync_gcode)
+            self.gcode.run_script_from_command(script)
             self.gcode.run_script_from_command("M400")
         except self.gcode.error as e:
             gcmd.respond_info(
