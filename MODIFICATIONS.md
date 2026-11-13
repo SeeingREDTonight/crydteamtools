@@ -6,7 +6,7 @@ commit `062d1dc` (speed_test v1.6.1, TMC Flow Test v1.2.2). Everything
 else is unchanged from upstream. To see every changed line:
 
 ```bash
-git diff 062d1dc -- speed_test max_flow_test install.sh
+git diff 062d1dc -- speed_test max_flow_test pa_test install.sh
 ```
 
 Developed and tested on an AWD CoreXY (4× TMC5160 on X/Y), Kalico,
@@ -25,6 +25,14 @@ Python code.
 Stock writes the upstream URL and branch `main` into Moonraker's update
 manager. Here it uses the clone's own `origin` remote and current
 branch, so Moonraker updates come from this fork and branch.
+
+---
+
+## PA test (`pa_test/`)
+
+| Change | Stock behaviour | Modified behaviour |
+|---|---|---|
+| Module and section name | Installs as `klippy/extras/pa_test.py` with section `[pa_test]`. That is the name of Klipper/Kalico's own PA tower module, so the installer's symlink replaces the firmware file: `PRINT_PA_TOWER` disappears, the firmware repo shows a modified tracked file, and an existing `[pa_test]` tower section loads the StallGuard probe instead. | Installs as `sg_pa_test.py` with section `[sg_pa_test]`, next to the firmware's module. `./install.sh pa_test` migrates an old install: removes the `pa_test.py` symlink, restores the firmware file with `git checkout`, and renames the section header in the copied `pa_test_settings.cfg`. Commands (`PA_TEST_PROBE`, `PA_TEST_GUI`) are unchanged. |
 
 ---
 

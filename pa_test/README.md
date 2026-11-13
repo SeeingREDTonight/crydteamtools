@@ -92,4 +92,3 @@ Klipper and Kalico. Re-running `./install.sh pa_test` migrates an old
 install: it removes the old symlink, restores the firmware's
 `klippy/extras/pa_test.py` from git, and renames the section in
 `pa_test_settings.cfg`.
-
