@@ -7461,10 +7461,17 @@ new Chart(document.getElementById('cvChart'), {
                     exp = max(cmd - bdw['sample_time'] * mm_s, cmd * 0.5)
                     meas = (now - bdw_before) / bdw['counts_per_mm']
                     rel = meas / exp / bdw_scale()
+                    # Mid-step, the current step is not in `results`
+                    # yet, so the full limit only applies once four
+                    # finished steps have shown the sensor reads this
+                    # filament well; until then only a jam stops it.
                     n_prior = sum(1 for x in results
                                   if (x.get('bdw') or {}).get('ratio')
                                   is not None)
-                    if rel < self._bdw_limit(n_prior):
+                    limit = (self._bdw_limit(n_prior)
+                             if n_prior >= self.BDW_TRUST_STEPS
+                             else min(self.BDW_JAM_LEVEL, min_ratio))
+                    if rel < limit:
                         return ("BDWidth saw %.0f %% of the expected feed "
                                 "after rep %d (%.0f of %.0f mm)"
                                 % (rel * 100, done, meas, cmd))
