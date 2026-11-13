@@ -35,6 +35,12 @@ Run the StallGuard-based flow test (Auto-SGT → Coarse → Bisection → Verifi
 | `NO_HTML` | 0 | Set 1 to skip HTML report |
 | `SKIP_TMC_CHECK` | 0 | Set 1 to bypass config validation |
 
+With a bdwidth or `[filament_motion_sensor]`, a step ends after the first
+rep that shows the filament stopped, instead of running all reps.
+
+Optional chamber fans are set in `tmc_flow_test_settings.cfg`
+(`chamber_fans:`), not on the command line.
+
 ### Examples
 
 ```

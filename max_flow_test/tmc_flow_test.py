@@ -507,6 +507,16 @@ class TMCFlowTest:
         else:
             self.extra_thermistors = []
 
+        # Optional chamber / filter fans to run for the whole test
+        # (air filtering only — they do not change the measurement).
+        # Comma-separated names; the type is detected at run start:
+        #   [fan_generic X]      → SET_FAN_SPEED FAN=X SPEED=1
+        #   [temperature_fan X]  → target set to its min_temp so it runs
+        # Previous speed / target is restored when the test ends.
+        cf_raw = config.get('chamber_fans', '').strip()
+        self.chamber_fans = [n.strip() for n in cf_raw.split(',')
+                             if n.strip()]
+
         config_dir = os.path.expanduser('~/printer_data/config')
         if not os.path.isdir(config_dir):
             config_dir = os.path.expanduser('~')
@@ -1511,7 +1521,7 @@ class TMCFlowTest:
                 verify_cv_for_hero, verify_repeats_for_hero)
             if str(quality_for_hero).startswith('stopped'):
                 status_text = ('Stopped on filament failure — last step '
-                               'that fed cleanly')
+                               'before the filament stopped')
             if (quality_for_hero in ('borderline', 'fragile')
                     or str(quality_for_hero).startswith('stopped')):
                 status_class = 'warning'
@@ -1564,6 +1574,11 @@ class TMCFlowTest:
                 % (meta['melt_limit'],
                    ('<br><em>Note: %s</em>' % meta['melt_fit_warning'])
                    if meta.get('melt_fit_warning') else ''))
+        if meta.get('slip_onset'):
+            hero_html += (
+                '<div class="summary" style="margin-top:12px">'
+                '<strong>Slip start (BDWidth feed):</strong> %s</div>'
+                % meta['slip_onset'])
 
         # Insights cards: 4 quick-glance summaries
         # 1) Result Quality
@@ -1586,7 +1601,7 @@ class TMCFlowTest:
             if str(quality_ic).startswith('stopped'):
                 quality_card_class = 'warning'
                 quality_value = 'Stopped'
-                quality_detail = ('filament failure — last clean step, '
+                quality_detail = ('filament failure — last step before the stop, '
                                   'not verified')
             quality_card = (
                 '<div class="insight-card %s">'
@@ -4054,12 +4069,79 @@ new Chart(document.getElementById('cvChart'), {
             'applied': True, 'source': source,
             'density': float(ctrl.const_filament_density),
             'heat_capacity': float(ctrl.const_filament_heat_capacity)})
-        gcmd.respond_info(
-            "MPC set for %s: density %.2f g/cm³, heat capacity %.2f J/g/K "
-            "(%s). Restored to %.2f / %.2f after the test."
-            % (material, state['density'], state['heat_capacity'],
-               source, orig[0], orig[1]))
+        # The macro reports the change itself; only the built-in path
+        # needs a line of its own.
+        if macro is None:
+            gcmd.respond_info(
+                "MPC set for %s: density %.2f, heat capacity %.2f "
+                "(restored to %.2f / %.2f after the test)."
+                % (material, state['density'], state['heat_capacity'],
+                   orig[0], orig[1]))
         return state
+
+    # ─── Chamber / filter fans (config: chamber_fans) ─────────────
+    def _chamber_fans_start(self, gcmd):
+        """Switch on the configured chamber fans; return what is needed
+        to put them back. Unknown names and other fan types are
+        reported and skipped."""
+        state = []
+        if not self.chamber_fans:
+            return state
+        now = self.reactor.monotonic()
+        on = []
+        for name in self.chamber_fans:
+            parts = name.split(None, 1)
+            short = parts[-1]
+            kinds = (('fan_generic', 'temperature_fan') if len(parts) == 1
+                     else (parts[0],))
+            obj = kind = None
+            for k in kinds:
+                o = self.printer.lookup_object('%s %s' % (k, short), None)
+                if o is not None:
+                    obj, kind = o, k
+                    break
+            if obj is None:
+                gcmd.respond_info(
+                    "chamber_fans: '%s' is not a [fan_generic] or "
+                    "[temperature_fan] — skipped." % name)
+                continue
+            try:
+                st = obj.get_status(now)
+                if kind == 'fan_generic':
+                    prev = float(st.get('speed', 0.0))
+                    self.gcode.run_script_from_command(
+                        "SET_FAN_SPEED FAN=%s SPEED=1" % short)
+                else:
+                    prev = float(st.get('target', 0.0))
+                    low = float(getattr(obj, 'min_temp', 0.0))
+                    self.gcode.run_script_from_command(
+                        "SET_TEMPERATURE_FAN_TARGET TEMPERATURE_FAN=%s "
+                        "TARGET=%.1f" % (short, low))
+                state.append({'name': short, 'kind': kind, 'prev': prev})
+                on.append(short)
+            except Exception as e:
+                gcmd.respond_info("chamber_fans: could not switch on "
+                                  "'%s' (%s) — skipped." % (name, e))
+        if on:
+            gcmd.respond_info("Chamber fans on for the test: %s "
+                              "(restored at the end)." % ", ".join(on))
+        return state
+
+    def _chamber_fans_restore(self, gcmd, state):
+        while state:
+            f = state.pop()
+            try:
+                if f['kind'] == 'fan_generic':
+                    self.gcode.run_script_from_command(
+                        "SET_FAN_SPEED FAN=%s SPEED=%.3f"
+                        % (f['name'], f['prev']))
+                else:
+                    self.gcode.run_script_from_command(
+                        "SET_TEMPERATURE_FAN_TARGET TEMPERATURE_FAN=%s "
+                        "TARGET=%.1f" % (f['name'], f['prev']))
+            except Exception as e:
+                gcmd.respond_info("Could not restore fan '%s' (%s)."
+                                  % (f['name'], e))
 
     def _mpc_restore(self, gcmd, state):
         if not state.get('applied'):
@@ -4186,8 +4268,14 @@ new Chart(document.getElementById('cvChart'), {
         return out
 
     def _measure_step(self, gcmd, target_flow, step_duration, repeat,
-                      skip_warmup=True):
-        """Run a single flow measurement (multiple repetitions, aggregate)."""
+                      skip_warmup=True, rep_check=None, quiet=False):
+        """Run a single flow measurement (multiple repetitions, aggregate).
+
+        rep_check(reps_done, rep_len_mm, mm_per_s) is called after every
+        rep but the last; a non-empty return ends the step early (the
+        filament clearly stopped — no point grinding the other reps).
+        quiet=True skips the summary line (the caller prints its own)."""
+        early_stop = None
         mm_per_sec = target_flow / self.filament_area
         feed_rate = mm_per_sec * 60.0
         extrude_length = mm_per_sec * step_duration
@@ -4245,6 +4333,12 @@ new Chart(document.getElementById('cvChart'), {
                     run_sg_raw, sg2_driver=self.sg2_driver))
 
             if rep < repeat - 1:
+                if rep_check is not None:
+                    why = rep_check(rep + 1, extrude_length, mm_per_sec)
+                    if why:
+                        early_stop = {'reps': rep + 1, 'of': repeat,
+                                      'reason': why}
+                        break
                 self.gcode.run_script_from_command("G4 P300")
 
         # Warmup-skip: if first run deviates more than the profile's
@@ -4335,10 +4429,11 @@ new Chart(document.getElementById('cvChart'), {
         pwm_avg = (thermal_agg or {}).get('pwm_avg')
         if pwm_avg is not None and pwm_avg >= self.profile.PWM_SATURATED:
             dip_str += ' | heater at 100%% (thermal limit reached)'
-        gcmd.respond_info(
-            "  %.1f mm³/s | SG median = %s | "
-            "run-to-run CV = %s%s%s"
-            % (target_flow, sg_med_str, cv_str, dip_str, warmup_str))
+        if not quiet:
+            gcmd.respond_info(
+                "  %.1f mm³/s | SG median = %s | "
+                "run-to-run CV = %s%s%s"
+                % (target_flow, sg_med_str, cv_str, dip_str, warmup_str))
 
         # Augment with recovery diagnostics (mainly: did the heater
         # come back to target between reps?)
@@ -4369,6 +4464,11 @@ new Chart(document.getElementById('cvChart'), {
             'peak': peak_agg,
             'thermal': thermal_agg,
             'intra_run': self._aggregate_intra_run_trends(per_run_trends),
+            'early_stop': early_stop,
+            'summary': {'sg': sg_med_str, 'cv': cv_str,
+                        'dips': (dip_agg or {}).get('count'),
+                        'peaks': (peak_agg or {}).get('count'),
+                        'warmup': warmup_dropped},
         }
 
     # ─── Trigger detection — SG-only mode ──────────────────────────
@@ -4846,6 +4946,62 @@ new Chart(document.getElementById('cvChart'), {
                 "clog)" % (rel * 100, cur.get('meas_mm') or 0.0,
                            cur.get('cmd_mm') or 0.0, scale,
                            min_ratio * 100))
+
+    SLIP_ONSET_FRAC = 0.90   # feed below this × low-flow reading = slip
+
+    def _slip_onset(self, results):
+        """Where partial slip starts, from BDWidth (report only).
+
+        Feed ratios are scaled by the median of the first three steps
+        (the sensor's own scale for this filament, clamped 0.8–1.2).
+        Slip start = the lowest flow from which every higher step reads
+        below SLIP_ONSET_FRAC, so a single noisy dropout lower down is
+        ignored."""
+        steps = [(r['flow'], r['bdw']['ratio']) for r in results
+                 if (r.get('bdw') or {}).get('ratio') is not None]
+        if len(steps) < 3:
+            return None
+        first = sorted(v for _, v in steps[:3])
+        scale = min(max(first[1], 0.8), 1.2)
+        frac = self.SLIP_ONSET_FRAC
+        by_flow = sorted((f, v / scale) for f, v in steps)
+        onset = None
+        for i, (f, rel) in enumerate(by_flow):
+            if all(rr < frac for _, rr in by_flow[i:]):
+                onset = (f, rel)
+                break
+        out = {'frac': frac, 'scale': scale,
+               'max_tested': by_flow[-1][0]}
+        if onset is None:
+            out.update({'onset': None})
+            return out
+        clean = [f for f, rr in by_flow
+                 if f < onset[0] - 0.001 and rr >= frac]
+        out.update({'onset': onset[0], 'onset_rel': onset[1],
+                    'last_clean': max(clean) if clean else None})
+        return out
+
+    def _live_melt_expect(self, results):
+        """Expected heater duty for the latest step from the low-flow
+        line fitted so far (steps 2–5 in run order; no drift correction
+        yet — the end idle comes later). None while still fitting."""
+        pts = [(r['flow'], r['thermal']['pwm_avg']) for r in results
+               if (r.get('thermal') or {}).get('pwm_avg') is not None
+               and r.get('flow') and not r.get('hard_fail')]
+        if len(pts) <= 1 + self.MELT_FIT_STEPS:
+            return None
+        fit = pts[1:1 + self.MELT_FIT_STEPS]
+        n = len(fit)
+        sx = sum(f for f, _ in fit)
+        sy = sum(v for _, v in fit)
+        sxx = sum(f * f for f, _ in fit)
+        sxy = sum(f * v for f, v in fit)
+        den = n * sxx - sx * sx
+        if den <= 0:
+            return None
+        b = (n * sxy - sx * sy) / den
+        a = (sy - b * sx) / n
+        return {'a': a, 'b': b}
 
     def _check_heater_collapse(self, results):
         """Detect that the hotend stopped melting the commanded flow.
@@ -6913,11 +7069,14 @@ new Chart(document.getElementById('cvChart'), {
         """Run the StallGuard-based flow test."""
         self._lookup_tmc()
         self._mpc_state = None
+        self._fan_state = []
         try:
             self._run_find_max(gcmd)
         except _HardStop:
             pass  # already reported and cleaned up
         finally:
+            if getattr(self, '_fan_state', None):
+                self._chamber_fans_restore(gcmd, self._fan_state)
             # MATERIAL= changed MPC: never leave it changed, even if the
             # run aborted before its own cleanup.
             st = getattr(self, '_mpc_state', None)
@@ -7184,6 +7343,13 @@ new Chart(document.getElementById('cvChart'), {
                 "skipped. Heater collapse still catches stalls and "
                 "strips.")
 
+        # ─── Chamber / filter fans (config: chamber_fans) ───
+        # Before the idle baseline, so both idle readings see them.
+        self._fan_state = self._chamber_fans_start(gcmd)
+        if self._fan_state:
+            meta['chamber_fans'] = ', '.join(
+                f['name'] for f in self._fan_state)
+
         # ─── Idle heater baseline (start) ───
         # Fan is already locked, so the idle losses match the test.
         if idle_s > 0:
@@ -7211,34 +7377,116 @@ new Chart(document.getElementById('cvChart'), {
         results = []
         trigger_events_ref = []   # same list object as trigger_events
 
+        def bdw_scale():
+            """Sensor scale for this filament: median feed ratio of the
+            steps so far (clamped 0.8–1.2; 1.0 until two exist)."""
+            prior = sorted(r['bdw']['ratio'] for r in results
+                           if (r.get('bdw') or {}).get('ratio')
+                           is not None)
+            if len(prior) < 2:
+                return 1.0
+            n = len(prior)
+            m = (prior[n // 2] if n % 2
+                 else (prior[n // 2 - 1] + prior[n // 2]) / 2.0)
+            return min(max(m, 0.8), 1.2)
+
         def measure_annotated(flow, reps):
             """_measure_step plus the data-only extras: time since the
-            start baseline (for idle-drift correction) and BDWidth
-            measured filament motion."""
+            start baseline (for idle-drift correction), filament motion
+            (BDWidth / encoder), a per-rep stop when the filament has
+            clearly stopped, and one combined console line."""
             bdw_before = (self._bdwidth_total(bdw)
                           if bdw is not None else None)
+            min_ratio = getattr(self, '_bdw_min_ratio', 0.0) or 0.0
+
+            def rep_check(done, rep_len, mm_s):
+                # No wait here: the sensor may lag by up to one sample
+                # period, so that much is taken off the expected length
+                # (errs towards NOT stopping).
+                if bdw is not None and bdw_before is not None \
+                        and min_ratio > 0:
+                    try:
+                        now = float(bdw['obj'].actual_total_move)
+                    except Exception:
+                        return None
+                    cmd = rep_len * done
+                    exp = max(cmd - bdw['sample_time'] * mm_s, cmd * 0.5)
+                    meas = (now - bdw_before) / bdw['counts_per_mm']
+                    rel = meas / exp / bdw_scale()
+                    if rel < min_ratio:
+                        return ("BDWidth saw %.0f %% of the expected feed "
+                                "after rep %d (%.0f of %.0f mm)"
+                                % (rel * 100, done, meas, cmd))
+                if enc is not None:
+                    e = self._encoder_step(enc)
+                    gap = e.get('gap_mm')
+                    if gap is not None and gap > enc['gap_limit']:
+                        return ("encoder saw no movement for %.0f mm "
+                                "(limit %.1f mm) after rep %d"
+                                % (gap, enc['gap_limit'], done))
+                return None
+
+            check_fn = (rep_check if (bdw is not None or enc is not None)
+                        else None)
             r = self._measure_step(
-                gcmd, flow, step_duration, reps)
+                gcmd, flow, step_duration, reps, rep_check=check_fn,
+                quiet=True)
             r['t_s'] = self.reactor.monotonic() - t0
+            es = r.get('early_stop')
+            reps_done = es['reps'] if es else reps
+            parts = []
+            sm = r.get('summary') or {}
+            sg_txt = "SG %s (CV %s" % (sm.get('sg', 'n/a'),
+                                       sm.get('cv', 'n/a'))
+            sg_txt += ", dips %d" % (sm.get('dips') or 0)
+            if sm.get('peaks'):
+                sg_txt += ", peaks %d" % sm['peaks']
+            if sm.get('warmup'):
+                sg_txt += ", run 1 dropped"
+            parts.append(sg_txt + ")")
+            pwm = (r.get('thermal') or {}).get('pwm_avg')
+            if pwm is not None:
+                lf = self._live_melt_expect(results + [r])
+                if lf is None:
+                    h = "heater %.1f%% (fitting line…)" % (pwm * 100)
+                elif lf['b'] <= 0:
+                    h = ("heater %.1f%% (low-flow line is flat — no "
+                         "expected value)" % (pwm * 100))
+                else:
+                    exp = lf['a'] + lf['b'] * flow
+                    h = ("heater %.1f%% vs %.1f%% exp (%.0f%% of line)"
+                         % (pwm * 100, exp * 100,
+                            (pwm - lf['a']) / (lf['b'] * flow) * 100))
+                if pwm >= self.profile.PWM_SATURATED:
+                    h += " SATURATED"
+                parts.append(h)
             if bdw is not None:
                 bdw_after = self._bdwidth_total(bdw)
                 cmd_mm = (flow / self.filament_area) * step_duration \
-                    * reps
+                    * reps_done
                 r['bdw'] = self._bdwidth_step(
                     bdw, bdw_before, bdw_after, cmd_mm)
                 b = r['bdw']
                 if b.get('meas_mm') is not None:
-                    gcmd.respond_info(
-                        "    BDWidth: %.1f of %.1f mm commanded (%.1f %%)"
-                        % (b['meas_mm'], b['cmd_mm'], b['ratio'] * 100))
+                    parts.append("BDWidth %.0f / %.0f mm (%.0f%%)"
+                                 % (b['meas_mm'], b['cmd_mm'],
+                                    b['ratio'] * 100))
             if enc is not None:
                 r['enc'] = self._encoder_step(enc)
                 gap = r['enc'].get('gap_mm')
                 if gap is not None:
-                    gcmd.respond_info(
-                        "    Encoder: last pulse %.1f mm before the end "
-                        "of the step (limit %.1f mm)"
-                        % (gap, enc['gap_limit']))
+                    if gap > enc['gap_limit']:
+                        parts.append("encoder STOPPED (no pulse for "
+                                     "%.0f mm)" % gap)
+                    else:
+                        parts.append("encoder OK (last pulse %.1f mm "
+                                     "ago, limit %.0f mm)"
+                                     % (gap, enc['gap_limit']))
+            if es:
+                parts.append("stopped after rep %d/%d"
+                             % (es['reps'], es['of']))
+            gcmd.respond_info("  %.1f mm³/s | %s" % (flow,
+                                                     " | ".join(parts)))
             return r
 
         def measure_and_save(flow, phase):
@@ -7257,6 +7505,12 @@ new Chart(document.getElementById('cvChart'), {
             if reason and getattr(self, '_hard_failure', None):
                 results[-1]['hard_fail'] = True
                 hard_stop(reason)
+            es = (results[-1].get('early_stop') or {}) if results else {}
+            if es.get('reason'):
+                # A rep already showed the filament stopped; the
+                # whole-step checks normally agree, but stop regardless.
+                results[-1]['hard_fail'] = True
+                hard_stop(es['reason'])
             return reason
 
         def hard_stop(reason):
@@ -7344,21 +7598,45 @@ new Chart(document.getElementById('cvChart'), {
                 self._encoder_restore(gcmd, enc)
             if mpc_state is not None:
                 self._mpc_restore(gcmd, mpc_state)
-            if idle_s <= 0:
-                return
+            report_slip_onset()
             try:
-                ib_end = self._measure_idle_baseline(
-                    gcmd, settle_s, idle_s, 'end')
-            except Exception as e:
-                gcmd.respond_info("  Idle baseline (end) skipped: %s"
-                                  % (e,))
+                if idle_s <= 0:
+                    return
+                try:
+                    ib_end = self._measure_idle_baseline(
+                        gcmd, settle_s, idle_s, 'end')
+                except Exception as e:
+                    gcmd.respond_info("  Idle baseline (end) skipped: %s"
+                                      % (e,))
+                    return
+                if ib_end:
+                    meta['idle_pwm_end'] = round(ib_end['pwm'], 4)
+                    meta['idle_temp_end'] = round(ib_end['temp'], 2)
+                    meta['idle_t_end_s'] = round(
+                        ib_end['t_mid'] - t0, 1)
+                report_melt_knee()
+            finally:
+                # Chamber fans ran through the end idle as well.
+                self._chamber_fans_restore(gcmd, self._fan_state)
+
+        def report_slip_onset():
+            s = self._slip_onset(results)
+            if s is None:
                 return
-            if ib_end:
-                meta['idle_pwm_end'] = round(ib_end['pwm'], 4)
-                meta['idle_temp_end'] = round(ib_end['temp'], 2)
-                meta['idle_t_end_s'] = round(
-                    ib_end['t_mid'] - t0, 1)
-            report_melt_knee()
+            if s['onset'] is None:
+                meta['slip_onset'] = ('no slip seen (BDWidth feed stayed '
+                                      'within %.0f %% of the low-flow '
+                                      'reading up to %.1f mm³/s)'
+                                      % (s['frac'] * 100, s['max_tested']))
+            else:
+                meta['slip_onset'] = (
+                    '%.1f mm³/s (feed %.0f %% of the low-flow reading; '
+                    'last clean step %s)'
+                    % (s['onset'], s['onset_rel'] * 100,
+                       ('%.1f mm³/s' % s['last_clean'])
+                       if s['last_clean'] is not None else 'none'))
+            gcmd.respond_info("Slip start (BDWidth, report only): %s"
+                              % meta['slip_onset'])
 
         def report_melt_knee():
             knee = self._melt_knee(results, meta)

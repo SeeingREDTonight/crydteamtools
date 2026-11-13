@@ -72,9 +72,15 @@ StallGuard. The stock SG triggers are all still active.
 With no motion sensor at all, the feed checks are skipped (console note)
 and heater collapse alone catches stalls and strips.
 
-When either fires, the test stops on the spot (bisecting further only
-grinds damaged filament), reports the last step that fed cleanly as the
-mechanical limit, saves the report, restores SGT / fan / bdwidth, then
+The feed checks also run after every rep inside a step (5 reps by
+default): when one rep already shows the filament stopped, the step ends
+there instead of grinding through the remaining reps. The CSV
+`n_repeats` column shows how many reps ran. The heater checks still use
+the whole step (one rep is too noisy for them).
+
+When any check fires, the test stops on the spot (bisecting further only
+grinds damaged filament), reports the last step before the filament
+stopped as the mechanical limit, saves the report, restores SGT / fan / bdwidth, then
 measures the end-of-run idle baseline (safe to cancel).
 
 ### Melt limit (report only, never stops the test)
@@ -111,6 +117,15 @@ Use `COARSE_STEP=5` and `START` ≥ 25 (enables the two reference steps).
 With 10 mm³/s steps the stock SG plateau trigger tends to fire on the
 normal SG curve.
 
+### Slip start (report only, needs bdwidth)
+
+The 60 % feed check only catches a filament that stopped; partial slip
+(e.g. 84 % feed) passes it. The run therefore also reports where slip
+starts: the lowest flow from which every higher step reads below 90 % of
+the low-flow feed reading (a single noisy dropout lower down is
+ignored), plus the last clean step — console, HTML and CSV header
+`slip_onset`.
+
 ### Data capture
 
 - New CSV columns: `t_s, idle_pwm, melt_duty, melt_duty_per_flow,
@@ -127,6 +142,17 @@ normal SG curve.
   CSV that produced the report and files already loaded are rejected;
   a different or unrecorded material is flagged.
 - CSV header now also records `result_max_flow` and `result_quality`.
+- Console: one line per step with StallGuard (median, run-to-run CV,
+  dips), heater duty vs what the low-flow line expects (from step 6 on)
+  and BDWidth measured / commanded mm or the encoder state, instead of
+  separate lines.
+
+### Chamber fans (config `chamber_fans`)
+
+Optional list of fans to run for the whole test (air filtering), e.g.
+`chamber_fans: Nevermore, chamber`. `[fan_generic]` fans run at 100 %;
+`[temperature_fan]` fans get their target set to `min_temp` so they run.
+Previous speeds / targets are restored at the end, also on abort.
 
 ### Other fixes
 
