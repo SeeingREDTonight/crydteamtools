@@ -25,6 +25,16 @@ Python code.
 Stock writes the upstream URL and branch `main` into Moonraker's update
 manager. Here it uses the clone's own `origin` remote and current
 branch, so Moonraker updates come from this fork and branch.
+Re-running it also corrects `origin` / `primary_branch` in an existing
+entry.
+
+All macro and settings `.cfg` files go into a `crydteamtools/` folder in
+the config directory (stock: the config root), included as
+`[include crydteamtools/<file>]`. Existing includes are recognised
+wherever they are, also a folder-wide `[include crydteamtools/*.cfg]`.
+Files from an older install are moved into the folder and their
+includes repointed; a root copy that clashes with a file already in the
+folder is archived. Uninstall removes the folder once it is empty.
 
 ---
 

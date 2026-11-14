@@ -53,7 +53,7 @@ cd crydteamtools
 ~/klipper/klippy/extras/speed_test.py`)
 
 The installer also drops a fully commented `speed_test_settings.cfg` into
-your config directory and includes it at the top of `printer.cfg`. To
+the `crydteamtools/` folder of your config directory and includes it at the top of `printer.cfg`. To
 enable the plugin, open that file, uncomment the `[speed_test]` line, then
 `sudo systemctl restart klipper`. Every option is documented in the file.
 

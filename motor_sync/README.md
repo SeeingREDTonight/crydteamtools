@@ -60,8 +60,8 @@ cd crydteamtools
 ./install.sh motor_sync
 ```
 
-The installer drops a fully commented `motor_sync_settings.cfg` into your
-config directory and includes it at the top of `printer.cfg` — uncomment
+The installer drops a fully commented `motor_sync_settings.cfg` into the
+`crydteamtools/` folder of your config directory and includes it at the top of `printer.cfg` — uncomment
 the `[motor_sync]` line in that file, then `FIRMWARE_RESTART`.
 
 ## Usage

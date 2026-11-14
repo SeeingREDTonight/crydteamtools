@@ -64,15 +64,20 @@ directly: `./install.sh all`, `./install.sh speed_test`,
 `./install.sh max_flow_test`). It does everything automatically:
 
 - symlinks the plugin files into Klipper's `extras` folder
-- symlinks the UI macros into your config directory
-- copies a fully commented `…_settings.cfg` template per plugin into your
-  config directory (your edits survive updates)
-- adds the `[include …]` lines for macros and settings to the top of
-  `printer.cfg`
+- symlinks the UI macros into a `crydteamtools/` folder in your config
+  directory
+- copies a fully commented `…_settings.cfg` template per plugin into the
+  same folder (your edits survive updates)
+- adds `[include crydteamtools/…]` lines for macros and settings to the
+  top of `printer.cfg` — unless they are already included somewhere,
+  including a folder-wide `[include crydteamtools/*.cfg]`
+- moves files from older installs (config root) into the folder and
+  repoints their `[include]` lines; if the folder already has a file of
+  the same name, the root copy is archived and the folder's is kept
 - registers the repo with Moonraker's update manager
 
-The only manual step left: open the plugin's settings file (e.g.
-`speed_test_settings.cfg` / `tmc_flow_test_settings.cfg`) in the
+The only manual step left: open the plugin's settings file in
+`crydteamtools/` (e.g. `speed_test_settings.cfg` / `tmc_flow_test_settings.cfg`) in the
 Mainsail/Fluidd config editor, uncomment the section header
 (`[speed_test]` / `[tmc_flow_test]`), then run `sudo systemctl restart klipper`. Every
 option is documented in the file with its default value.

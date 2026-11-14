@@ -20,6 +20,10 @@ REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 KLIPPER_EXTRAS="${HOME}/klipper/klippy/extras"
 CONFIG_DIR="${HOME}/printer_data/config"
 ARCHIVE_DIR="${CONFIG_DIR}/archive"
+# All macro and settings .cfg files live in this sub-folder of the
+# config dir and are included as [include crydteamtools/<file>].
+CFG_SUB="crydteamtools"
+CFG_DIR="${CONFIG_DIR}/${CFG_SUB}"
 PRINTER_CFG="${CONFIG_DIR}/printer.cfg"
 MOONRAKER_CONF="${CONFIG_DIR}/moonraker.conf"
 UPDATER_NAME="crydteamtools"
@@ -190,11 +194,12 @@ migrate_pa_test_name() {
                 ;;
         esac
     fi
-    st="${CONFIG_DIR}/pa_test_settings.cfg"
-    if [ -f "$st" ] && grep -Eq '^[[:space:]#]*\[pa_test\]' "$st"; then
-        sed -i -E 's/^([[:space:]#]*)\[pa_test\]/\1[sg_pa_test]/' "$st"
-        echo "  ✓ pa_test_settings.cfg: section renamed to [sg_pa_test]"
-    fi
+    for st in "${CFG_DIR}/pa_test_settings.cfg" "${CONFIG_DIR}/pa_test_settings.cfg"; do
+        if [ -f "$st" ] && grep -Eq '^[[:space:]#]*\[pa_test\]' "$st"; then
+            sed -i -E 's/^([[:space:]#]*)\[pa_test\]/\1[sg_pa_test]/' "$st"
+            echo "  ✓ pa_test_settings.cfg: section renamed to [sg_pa_test]"
+        fi
+    done
 }
 
 # True if "[include <file>]" already exists ANYWHERE in the config
@@ -203,10 +208,46 @@ migrate_pa_test_name() {
 # lines. A duplicate include would break Klipper at restart, so this
 # check errs on the side of finding existing entries.
 include_present() {   # include_present <cfg-file-name>
+    # Matches [include x.cfg], [include any/path/x.cfg] and a glob over
+    # the folder such as [include crydteamtools/*.cfg].
     esc=$(printf '%s' "$1" | sed 's/[][\.*^$]/\\&/g')
     grep -rEqs --include='*.cfg' \
-        "^[[:space:]]*\[include[[:space:]]+${esc}[[:space:]]*\]" \
+        "^[[:space:]]*\[include[[:space:]]+([^]]*/)?${esc}[[:space:]]*\]" \
+        "${CONFIG_DIR}" 2>/dev/null && return 0
+    grep -rEqs --include='*.cfg' \
+        "^[[:space:]]*\[include[[:space:]]+(\./)?${CFG_SUB}/\*(\.cfg)?[[:space:]]*\]" \
         "${CONFIG_DIR}" 2>/dev/null
+}
+
+# Move a plugin .cfg from the config root (older installs) into the
+# crydteamtools folder and repoint its [include] lines. Macro files are
+# symlinks and are simply recreated; settings files are user-edited and
+# moved as they are. If the folder already holds the file (moved by
+# hand), the root copy is archived instead of overwriting it.
+migrate_cfg() {   # migrate_cfg <cfg-file-name>
+    local name="$1" old="${CONFIG_DIR}/$1" new="${CFG_DIR}/$1" esc cfg
+    esc=$(printf '%s' "$name" | sed 's/[][\.*^$/]/\\&/g')
+    while IFS= read -r cfg; do
+        if grep -Eq "^[[:space:]]*\[include[[:space:]]+${esc}[[:space:]]*\]" "$cfg"; then
+            sed -i -E "s#^([[:space:]]*\[include[[:space:]]+)${esc}([[:space:]]*\])#\1${CFG_SUB}/${name}\2#" "$cfg"
+            echo "  ✓ [include ${name}] → [include ${CFG_SUB}/${name}] in $(basename "$cfg")"
+        fi
+    done < <(find "${CONFIG_DIR}" -maxdepth 2 -name '*.cfg' -type f 2>/dev/null)
+    if [ -L "$old" ]; then
+        rm -f "$old"
+    elif [ -f "$old" ]; then
+        if [ -e "$new" ]; then
+            if cmp -s "$old" "$new"; then
+                rm -f "$old"
+            else
+                archive_file "$old"
+                echo "    (${CFG_SUB}/${name} already existed and was kept)"
+            fi
+        else
+            mv "$old" "$new"
+            echo "  ✓ ${name} moved into ${CFG_SUB}/"
+        fi
+    fi
 }
 
 # Insert "[include <file>]" at the VERY TOP of printer.cfg — only if
@@ -217,12 +258,12 @@ add_include_top() {   # add_include_top <cfg-file-name>
         return
     fi
     if include_present "$1"; then
-        echo "  • [include $1] already present — skipped"
+        echo "  • [include ${CFG_SUB}/$1] already present — skipped"
     else
         tmp="$(mktemp)"
-        { echo "[include $1]"; cat "${PRINTER_CFG}"; } > "$tmp"
+        { echo "[include ${CFG_SUB}/$1]"; cat "${PRINTER_CFG}"; } > "$tmp"
         mv "$tmp" "${PRINTER_CFG}"
-        echo "  ✓ [include $1] added to top of printer.cfg"
+        echo "  ✓ [include ${CFG_SUB}/$1] added to top of printer.cfg"
     fi
 }
 
@@ -234,8 +275,8 @@ remove_include() {   # remove_include <cfg-file-name>
     local esc
     esc=$(printf '%s' "$name" | sed 's/[][\.*^$/]/\\&/g')
     while IFS= read -r cfg; do
-        if grep -Eq "^[[:space:]]*\[include[[:space:]]+${esc}[[:space:]]*\]" "$cfg"; then
-            sed -i -E "/^[[:space:]]*\[include[[:space:]]+${esc}[[:space:]]*\]/d" "$cfg"
+        if grep -Eq "^[[:space:]]*\[include[[:space:]]+([^]]*\/)?${esc}[[:space:]]*\]" "$cfg"; then
+            sed -i -E "/^[[:space:]]*\[include[[:space:]]+([^]]*\/)?${esc}[[:space:]]*\]/d" "$cfg"
             echo "  ✓ [include ${name}] removed from $(basename "$cfg")"
             found=1
         fi
@@ -277,7 +318,8 @@ if [ "$MODE" = "uninstall" ]; then
             [ -n "$rel" ] || continue
             name="$(basename "$rel")"
             remove_include "$name"
-            target="${CONFIG_DIR}/${name}"
+            target="${CFG_DIR}/${name}"
+            [ -e "$target" ] || [ -L "$target" ] || target="${CONFIG_DIR}/${name}"
             repo_src="${REPO_DIR}/${rel}"
             if [ -L "$target" ]; then
                 rm -f "$target"       # macros are symlinks — just drop
@@ -290,6 +332,7 @@ if [ "$MODE" = "uninstall" ]; then
             fi
         done
     done
+    rmdir "${CFG_DIR}" 2>/dev/null && echo "  ✓ empty ${CFG_SUB}/ folder removed"
 
     # Drop the Moonraker entry only when no plugin is left installed.
     still_installed=0
@@ -350,7 +393,8 @@ if [ "${#ALREADY[@]}" -gt 0 ]; then
     echo "Already installed: ${ALREADY[*]}"
     echo "  An update re-links the plugin files (picking up the code"
     echo "  you just pulled) and adds any missing [include] lines."
-    echo "  Your existing *_settings.cfg files are NEVER overwritten."
+    echo "  Your existing *_settings.cfg files are NEVER overwritten; files"
+    echo "  still in the config root are moved into ${CFG_SUB}/."
     echo ""
     read -r -p "Update them? [Y/n/s=skip these, install only new]: " upd
     case "$upd" in
@@ -387,8 +431,15 @@ for id in "${SELECTED[@]}"; do
         echo "  ✓ $(basename "$rel") → ${dst}"
     done
     macro_rel="$(plugin_macros "$id")"
+    settings_rel="$(plugin_settings "$id")"
+    if [ -d "${CONFIG_DIR}" ]; then
+        mkdir -p "${CFG_DIR}"
+        for rel in "$macro_rel" "$settings_rel"; do
+            [ -n "$rel" ] && migrate_cfg "$(basename "$rel")"
+        done
+    fi
     if [ -n "$macro_rel" ] && [ -f "${REPO_DIR}/${macro_rel}" ] && [ -d "${CONFIG_DIR}" ]; then
-        dst="${CONFIG_DIR}/$(basename "$macro_rel")"
+        dst="${CFG_DIR}/$(basename "$macro_rel")"
         link "${REPO_DIR}/${macro_rel}" "$dst"
         echo "  ✓ $(basename "$macro_rel") → ${dst}"
         add_include_top "$(basename "$macro_rel")"
@@ -397,9 +448,8 @@ for id in "${SELECTED[@]}"; do
     # updates), then include it at the top of printer.cfg. The
     # section inside ships fully commented out, so including it
     # changes nothing until the user uncomments [<plugin section>].
-    settings_rel="$(plugin_settings "$id")"
     if [ -n "$settings_rel" ] && [ -f "${REPO_DIR}/${settings_rel}" ] && [ -d "${CONFIG_DIR}" ]; then
-        dst="${CONFIG_DIR}/$(basename "$settings_rel")"
+        dst="${CFG_DIR}/$(basename "$settings_rel")"
         if [ -f "$dst" ]; then
             echo "  • $(basename "$settings_rel") already exists — left untouched"
         else
@@ -418,7 +468,7 @@ for id in "${SELECTED[@]}"; do
     if [ "$id" = "max_flow_test" ] && [ -d "${CONFIG_DIR}" ]; then
         if ! grep -rEqs --include='*.cfg' '^[[:space:]]*\[tmc_flow_test\]' \
              "${CONFIG_DIR}"; then
-            st="${CONFIG_DIR}/tmc_flow_test_settings.cfg"
+            st="${CFG_DIR}/tmc_flow_test_settings.cfg"
             if [ -f "$st" ] && grep -q '^#\[tmc_flow_test\]' "$st"; then
                 sed -i 's/^#\[tmc_flow_test\]/[tmc_flow_test]/' "$st"
                 echo "  ✓ [tmc_flow_test] activated in tmc_flow_test_settings.cfg"
