@@ -28,7 +28,8 @@ It pushes a motor until it loses steps, then narrows in on the safe limit with a
 >
 > Both options are listed (commented out) in `speed_test_settings.cfg`.
 > Existing installs keep their settings file, so copy the lines you
-> want from the template in this folder.
+> want from the template in this folder. Usage and examples:
+> [docs/configuration.md](docs/configuration.md#options-added-in-this-fork).
 
 > Looking for the extruder StallGuard flow test? It lives in this repo too: [TMC Flow Test](../max_flow_test/README.md).
 

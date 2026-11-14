@@ -26,17 +26,26 @@ Run the StallGuard-based flow test (Auto-SGT → Coarse → Bisection → Verifi
 | `COLD_EXTRUSION_HINT` | 0 | Flow (mm³/s) you observed as under-extruding; drawn as a marker line in the HTML report. Report-only, the detection ignores it |
 | `MATERIAL` | (blank) | Filament type, e.g. `PLA`, `PETG`, `ABS`. Recorded in the CSV/HTML (the Compare tab checks it). On a Kalico MPC hotend it also sets MPC's filament density / heat capacity for the test — through your `_SET_MPC_MATERIAL` macro if you have one, otherwise from the table in Kalico's MPC docs — and restores the previous values afterwards. Blank = unchanged behaviour |
 | `TEMP` | 0 | Hotend temperature (°C) to heat to and wait for (within 1 °C, via `SET_HEATER_TEMPERATURE` + `TEMPERATURE_WAIT`) before the test. `0` keeps the current target (you heat manually) |
-| `SETTLE` | 20 | Seconds to hold temperature without extruding before each idle heater baseline, so the PID output is steady |
-| `IDLE` | 60 | Seconds of idle heater-duty measurement, taken at the start (after the fan is locked) and again at the end. Feeds the `idle_pwm`, `melt_duty` and `melt_duty_per_flow` CSV columns. Data only, no trigger. `0` disables both baselines |
-| `BDWIDTH` | auto | bdwidth sensor (name, `auto`, or `none`) whose motion counter is read before and after every step. Switched to motion-only (and `M221 S100`) for the test, restored at the end. Feeds the `bdw_cmd_mm`, `bdw_meas_mm` and `bdw_ratio` CSV columns. Triggers only through `BDW_MIN_RATIO` |
-| `BDW_MIN_RATIO` | 0.6 | Fail a step when BDWidth saw less than this fraction of the expected filament feed (scale-corrected by the earlier steps' median). Coarse on purpose: the sensor is good for "filament stopped", not for a few percent of slip. `0` = record only |
-| `ENCODER` | auto | Klipper `[filament_motion_sensor]` (e.g. BTT SFS) used for a "filament stopped" check when no bdwidth is found: name, `auto` or `none`. Its runout action is disabled during the test and restored after. Adds the `enc_gap_mm` CSV column |
-| `ENCODER_GAP` | 0 (auto) | Fail a step when the extruder pushed this many mm past the encoder's last pulse. Auto = 2 × the sensor's `detection_length`, at least 10 mm |
+| `SETTLE` | 20 (config `idle_settle`) | Seconds to hold temperature without extruding before each idle heater baseline, so the PID output is steady |
+| `IDLE` | 60 (config `idle_measure`) | Seconds of idle heater-duty measurement, taken at the start (after the fan is locked) and again at the end. Feeds the `idle_pwm`, `melt_duty` and `melt_duty_per_flow` CSV columns. Data only, no trigger. `0` disables both baselines |
+| `BDWIDTH` | auto (config `bdwidth`) | bdwidth sensor (name, `auto`, or `none`) whose motion counter is read before and after every step. Switched to motion-only (and `M221 S100`) for the test, restored at the end. Feeds the `bdw_cmd_mm`, `bdw_meas_mm` and `bdw_ratio` CSV columns. Triggers only through `BDW_MIN_RATIO` |
+| `BDW_MIN_RATIO` | 0.6 (config `bdw_min_ratio`) | Fail a step when BDWidth saw less than this fraction of the expected filament feed (scale-corrected by the earlier steps' median). Coarse on purpose: the sensor is good for "filament stopped", not for a few percent of slip. `0` = record only |
+| `ENCODER` | auto (config `encoder`) | Klipper `[filament_motion_sensor]` (e.g. BTT SFS) used for a "filament stopped" check when no bdwidth is found: name, `auto` or `none`. Its runout action is disabled during the test and restored after. Adds the `enc_gap_mm` CSV column |
+| `ENCODER_GAP` | 0 = auto (config `encoder_gap`) | Fail a step when the extruder pushed this many mm past the encoder's last pulse. Auto = 2 × the sensor's `detection_length`, at least 10 mm |
 | `NO_HTML` | 0 | Set 1 to skip HTML report |
 | `SKIP_TMC_CHECK` | 0 | Set 1 to bypass config validation |
 
+Defaults marked *config* can be set in `tmc_flow_test_settings.cfg`
+under `[tmc_flow_test]` (the lower-case name shown); the parameter on the
+command still overrides them for that run. That is also the way to use
+them with `CRYD_FLOW_TEST` and the GUI, which do not pass these
+parameters on. `TEMP` and `MATERIAL` are command-only — heat the hotend
+yourself (or call `TMC_FLOW_FIND_MAX` directly) when using the macro.
+
 With a bdwidth or `[filament_motion_sensor]`, a step ends after the first
-rep that shows the filament stopped, instead of running all reps.
+rep that shows the filament stopped, instead of running all reps. If
+BDWidth reads the filament badly (median under 80 %, or erratic, over the
+first four steps), its checks become report-only for that run.
 
 Optional chamber fans are set in `tmc_flow_test_settings.cfg`
 (`chamber_fans:`), not on the command line.
@@ -64,6 +73,20 @@ TMC_FLOW_FIND_MAX REPEAT=3 VERIFY_REPEATS=3 COOLDOWN=10 COARSE_STEP=10
 
 # More accurate (longer)
 TMC_FLOW_FIND_MAX REPEAT=10 DURATION=8 VERIFY_REPEATS=10 COARSE_STEP=5
+
+# Heat to 240 °C, record the filament and set Kalico MPC for PLA
+TMC_FLOW_FIND_MAX START=25 COARSE_STEP=5 MAX=100 TEMP=240 MATERIAL=PLA
+
+# Same filament at several temperatures (load the CSVs into the
+# report's Compare runs tab afterwards)
+TMC_FLOW_FIND_MAX START=25 COARSE_STEP=5 MAX=100 TEMP=220 MATERIAL=PLA
+TMC_FLOW_FIND_MAX START=25 COARSE_STEP=5 MAX=100 TEMP=260 MATERIAL=PLA
+
+# Use a specific BDWidth sensor, record its feed but never stop on it
+TMC_FLOW_FIND_MAX START=25 COARSE_STEP=5 TEMP=240 BDWIDTH=fila_width_0 BDW_MIN_RATIO=0
+
+# No motion sensor at all (heater collapse alone stops the run), no idle readings
+TMC_FLOW_FIND_MAX START=25 COARSE_STEP=5 TEMP=240 BDWIDTH=none ENCODER=none IDLE=0
 ```
 
 ---

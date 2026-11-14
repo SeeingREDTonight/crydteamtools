@@ -27,8 +27,47 @@ max_current: 1.5              # hard safety cap (A). Upper bound for
 #output_dir: ~/printer_data/config/Speedtest
 ```
 
-After `FIRMWARE_RESTART`, run `SPEED_TEST_STATUS` to verify the plugin loaded
-and your axes are recognised.
+After `sudo systemctl restart klipper` (a `FIRMWARE_RESTART` does not reload
+the plugin's Python code after an update), run `SPEED_TEST_STATUS` to verify
+the plugin loaded and your axes are recognised.
+
+### Options added in this fork
+
+Both are listed, commented out with descriptions, in the template
+`speed_test_settings.cfg`. Existing installs keep their own settings file
+(in `crydteamtools/` in your config folder) — copy in the lines you want.
+
+```ini
+[speed_test]
+# Park the OTHER axis here during a single-axis test (X or Y), e.g. to
+# keep the toolhead clear of front motor towers near the ends of travel.
+# Unset = stock behaviour (the other axis stays where it is).
+park_x: 175
+#park_y: 175
+
+# What to run after a step loses steps, to re-sync dual-motor (AWD) belt
+# pairs before the next step — re-homing does not fix a pair whose two
+# motors slipped by different amounts.
+#   auto (default): SYNC_MOTORS (accelerometer, MRX8024/motors-sync) if
+#         loaded, else MOTOR_SYNC (StallGuard, this suite) if enabled,
+#         else a console note that the motors may now be out of sync.
+#         Single-motor axes are never re-synced.
+#   none: never re-sync
+#   anything else is run as G-code, e.g.
+#   skip_resync_gcode: SYNC_MOTORS AXES=x,y RETRIES=5
+#skip_resync_gcode: auto
+```
+
+Neither option needs anything on the command line: every test
+(`SPEED_TEST_FIND_LIMITS`, `…_FIND_MAX_VELOCITY`, `…_FIND_MAX_ACCEL`, …)
+picks them up from the config. For example, with `park_x: 175`:
+
+```
+SPEED_TEST_FIND_MAX_ACCEL AXIS=Y SPEED=200
+```
+
+parks X at 175 before every Y move, and if a step loses steps on the AWD
+Y pair you'll see the re-sync run in the console before the next step.
 
 ## UI macros (Mainsail / Fluidd)
 

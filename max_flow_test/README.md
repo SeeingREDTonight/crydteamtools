@@ -114,15 +114,32 @@ melt_zone_length: 42         # see hotend table below
 
 Your existing `[tmcXXXX extruder]` section also needs `driver_SFILT: 1` (TMC5160/2240 only). See [docs/ADVANCED.md](docs/ADVANCED.md#configuration) for full driver-specific settings.
 
-Optional, for filter / exhaust fans during the test:
+### Optional settings added in this fork
+
+All are listed, commented out with descriptions, in the template
+`tmc_flow_test_settings.cfg` in this folder. Existing installs keep their
+own settings file, so copy the lines you want into it (it lives in
+`crydteamtools/` in your config folder). Uncomment, edit, then
+`sudo systemctl restart klipper`.
 
 ```ini
+[tmc_flow_test]
+# Fans to run for the whole test (air filtering). fan_generic → 100 %;
+# temperature_fan → target 1 °C (or its min_temp) so it runs. Restored after.
 chamber_fans: Nevermore, chamber
+
+# Defaults for the TMC_FLOW_FIND_MAX parameter of the same name in upper
+# case; a parameter on the command still overrides them for one run.
+bdwidth: auto          # BDWidth sensor: auto, its name, or none
+bdw_min_ratio: 0.6     # stop below 60 % of the commanded feed; 0 = record only
+encoder: auto          # [filament_motion_sensor] used without BDWidth
+encoder_gap: 0         # mm without a pulse = stopped; 0 = auto
+idle_settle: 20        # s settle before each idle heater reading
+idle_measure: 60       # s idle reading; 0 = off (no melt limit)
 ```
 
-`[fan_generic]` fans run at 100 %; `[temperature_fan]` fans get their
-target set to 1 °C (or `min_temp`, if higher) so they run. Both are restored afterwards.
-Existing installs keep their settings file — add the line by hand.
+Setting these in the file is also how the `CRYD_FLOW_TEST` macro and the
+GUI use them — neither passes these parameters on.
 
 **Melt zone length**:
 - V6 / Revo Six: ~13 mm
@@ -159,19 +176,22 @@ With this fork's options (heat to 240 °C, record PLA, set MPC for it):
 TMC_FLOW_FIND_MAX START=25 COARSE_STEP=5 MAX=100 TEMP=240 MATERIAL=PLA
 ```
 
-| Parameter | Default | Purpose |
+| Parameter | Default (config option) | Purpose |
 |---|---|---|
-| `TEMP` | 0 | Heat the hotend and wait to within 1 °C. 0 = use the current target. |
-| `MATERIAL` | (blank) | Filament type (`PLA`, `PETG`, `ABS`, …). Recorded in the report; on a Kalico MPC hotend also sets MPC's filament constants for the run (via `_SET_MPC_MATERIAL` if you have it) and restores them afterwards. |
-| `SETTLE` / `IDLE` | 20 / 60 | Seconds of settle and idle heater measurement before and after the run. `IDLE=0` turns it off (and the melt limit with it). |
-| `BDWIDTH` | auto | BDWidth sensor name, `auto` or `none`. |
-| `BDW_MIN_RATIO` | 0.6 | Feed-check limit; 0 = record only. |
-| `ENCODER` / `ENCODER_GAP` | auto / 0 | `[filament_motion_sensor]` name and the mm without a pulse that counts as stopped (0 = auto). Used only without BDWidth. |
+| `TEMP` | 0 (command only) | Heat the hotend and wait to within 1 °C. 0 = use the current target. |
+| `MATERIAL` | blank (command only) | Filament type (`PLA`, `PETG`, `ABS`, …). Recorded in the report; on a Kalico MPC hotend also sets MPC's filament constants for the run (via `_SET_MPC_MATERIAL` if you have it) and restores them afterwards. |
+| `SETTLE` / `IDLE` | 20 / 60 (`idle_settle` / `idle_measure`) | Seconds of settle and idle heater measurement before and after the run. `IDLE=0` turns it off (and the melt limit with it). |
+| `BDWIDTH` | auto (`bdwidth`) | BDWidth sensor name, `auto` or `none`. |
+| `BDW_MIN_RATIO` | 0.6 (`bdw_min_ratio`) | Feed-check limit; 0 = record only. |
+| `ENCODER` / `ENCODER_GAP` | auto / 0 (`encoder` / `encoder_gap`) | `[filament_motion_sensor]` name and the mm without a pulse that counts as stopped (0 = auto). Used only without BDWidth. |
 
-The `CRYD_FLOW_TEST` macro and the GUI do not pass these on — type
-`TMC_FLOW_FIND_MAX` directly to use them. Use `COARSE_STEP=5` and
-`START` ≥ 25: with 10 mm³/s steps the stock StallGuard plateau trigger
-tends to fire on the normal curve.
+The `CRYD_FLOW_TEST` macro and the GUI do not pass these parameters on:
+set the config options above instead, and heat the hotend yourself.
+Use `COARSE_STEP=5` and `START` ≥ 25: with 10 mm³/s steps the stock
+StallGuard plateau trigger tends to fire on the normal curve.
+
+More examples (multi-temperature comparison, sensor options):
+[docs/COMMANDS.md](docs/COMMANDS.md#examples).
 
 ### Picking the right START / MAX
 

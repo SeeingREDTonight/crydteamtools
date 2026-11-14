@@ -513,6 +513,20 @@ class TMCFlowTest:
         #   [fan_generic X]      → SET_FAN_SPEED FAN=X SPEED=1
         #   [temperature_fan X]  → target set to 1 °C (or min_temp) so it runs
         # Previous speed / target is restored when the test ends.
+        # Defaults for TMC_FLOW_FIND_MAX parameters of the same name
+        # (upper case); a parameter on the command overrides them. Lets
+        # the CRYD_FLOW_TEST macro / GUI, which pass none of these, use
+        # them too.
+        self.cfg_bdwidth = config.get('bdwidth', 'auto').strip() or 'auto'
+        self.cfg_bdw_min_ratio = config.getfloat(
+            'bdw_min_ratio', 0.6, minval=0., maxval=0.95)
+        self.cfg_encoder = config.get('encoder', 'auto').strip() or 'auto'
+        self.cfg_encoder_gap = config.getfloat('encoder_gap', 0., minval=0.)
+        self.cfg_idle_settle = config.getfloat(
+            'idle_settle', 20., minval=0., maxval=900.)
+        self.cfg_idle_measure = config.getfloat(
+            'idle_measure', 60., minval=0., maxval=600.)
+
         cf_raw = config.get('chamber_fans', '').strip()
         self.chamber_fans = [n.strip() for n in cf_raw.split(',')
                              if n.strip()]
@@ -7172,26 +7186,29 @@ new Chart(document.getElementById('cvChart'), {
         #                 the start and again at the end (0 = off)
         #   BDWIDTH=<name|auto|none>  bdwidth sensor for motion data
         test_temp = gcmd.get_float('TEMP', 0.0, minval=0., maxval=400.)
-        settle_s = gcmd.get_float('SETTLE', 20.0, minval=0., maxval=900.)
-        idle_s = gcmd.get_float('IDLE', 60.0, minval=0., maxval=600.)
-        bdw_param = gcmd.get('BDWIDTH', 'auto').strip()
+        settle_s = gcmd.get_float('SETTLE', self.cfg_idle_settle,
+                                  minval=0., maxval=900.)
+        idle_s = gcmd.get_float('IDLE', self.cfg_idle_measure,
+                                minval=0., maxval=600.)
+        bdw_param = gcmd.get('BDWIDTH', self.cfg_bdwidth).strip()
         #   BDW_MIN_RATIO=<0..1>  fail a step when BDWidth saw less than
         #                 this fraction of the expected filament feed
         #                 (scale-corrected); 0 = record only, no trigger
         self._bdw_min_ratio = gcmd.get_float(
-            'BDW_MIN_RATIO', 0.6, minval=0., maxval=0.95)
+            'BDW_MIN_RATIO', self.cfg_bdw_min_ratio, minval=0., maxval=0.95)
         #   ENCODER=<name|auto|none>  Klipper [filament_motion_sensor]
         #                 (e.g. BTT SFS) used when no bdwidth is found
         #   ENCODER_GAP=<mm>  fail a step when the extruder advanced this
         #                 far past the sensor's last pulse; 0 = auto
         #                 (2 × the sensor's detection_length, min 10 mm)
-        enc_param = gcmd.get('ENCODER', 'auto').strip()
+        enc_param = gcmd.get('ENCODER', self.cfg_encoder).strip()
         #   MATERIAL=<PLA|PETG|ABS|…>  recorded in the CSV/HTML (the
         #                 Compare tab checks it) and, on an MPC hotend,
         #                 used to set MPC's filament density / heat
         #                 capacity for the test. Blank = unchanged.
         material = gcmd.get('MATERIAL', '').strip().upper()
-        enc_gap = gcmd.get_float('ENCODER_GAP', 0.0, minval=0.)
+        enc_gap = gcmd.get_float('ENCODER_GAP', self.cfg_encoder_gap,
+                                 minval=0.)
 
         # Part-cooling fan speed for the test. Defaults to the value
         # in [tmc_flow_test] config (or 0 if not set). Override per

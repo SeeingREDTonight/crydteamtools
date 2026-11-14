@@ -145,6 +145,12 @@ Use `COARSE_STEP=5` and `START` ≥ 25 (enables the two reference steps).
 With 10 mm³/s steps the stock SG plateau trigger tends to fire on the
 normal SG curve.
 
+`BDWIDTH`, `BDW_MIN_RATIO`, `ENCODER`, `ENCODER_GAP`, `SETTLE` and `IDLE`
+take their defaults from the config options `bdwidth`, `bdw_min_ratio`,
+`encoder`, `encoder_gap`, `idle_settle` and `idle_measure` (listed in the
+settings template), so `CRYD_FLOW_TEST` and the GUI — which pass none of
+them — can use them too. `TEMP` and `MATERIAL` are command-only.
+
 ### Slip start (report only, needs bdwidth)
 
 The 60 % feed check only catches a filament that stopped; partial slip
