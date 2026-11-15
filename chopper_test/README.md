@@ -36,6 +36,14 @@ Full detail: [MODIFICATIONS.md](../MODIFICATIONS.md).
   `start_offset` (new option; default 20 % of the travel) from the end
   the axis homes to. Stock always started from the position_min end.
 - X/Y are always re-homed before the first measurement.
+- **Live run log.** Every run writes `chopper_<timestamp>.log` next to
+  the CSV, one line per event, flushed as it happens: setup, each
+  candidate applied, each measurement (move range, µstep difference of
+  every watched stepper after the re-home, move and homing time),
+  retries, re-syncs, picks and errors. A run that dies on a homing
+  error keeps its log, and the CSV is written with the results so far
+  (marked `ABORTED`). The same lines go to klippy.log, prefixed
+  `chopper_test:`.
 
 `CHOPPER_TEST_STATUS` lists the drivers that will be written, the park
 position and the re-sync method.

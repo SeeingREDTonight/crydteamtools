@@ -119,6 +119,8 @@ class ChopperTest:
         self._tmc_cache = {}
         self._tuned_cache = {}
         self._limits_snapshot = None
+        self._runlog = None
+        self._runlog_path = None
         self._originals = {}
         self._resync_noted = False
 
@@ -131,6 +133,52 @@ class ChopperTest:
             'CHOPPER_TEST_STATUS', self.cmd_STATUS,
             desc='Show the chopper registers of an axis and whether it '
                  'can be tuned')
+
+    # ─── Run log ────────────────────────────────────────────────────
+    # One line per event, written and flushed as it happens, so a run
+    # that ends in a homing error or a shutdown still leaves everything
+    # up to that point on disk. Mirrored into klippy.log.
+
+    def _log_open(self, timestamp):
+        self._runlog = None
+        self._runlog_path = None
+        self._log_t0 = self.reactor.monotonic()
+        try:
+            os.makedirs(self.output_dir, exist_ok=True)
+            path = os.path.join(self.output_dir,
+                                'chopper_%s.log' % timestamp)
+            self._runlog = open(path, 'w', encoding='utf-8')
+            self._runlog_path = path
+        except Exception as e:
+            logging.warning("chopper_test: cannot open run log: %s", e)
+
+    def _log(self, event, **kv):
+        line = "%8.2f %-9s %s" % (
+            self.reactor.monotonic() - getattr(self, '_log_t0', 0.0),
+            event,
+            " ".join("%s=%s" % (k, kv[k]) for k in kv))
+        logging.info("chopper_test: %s", line)
+        f = getattr(self, '_runlog', None)
+        if f is not None:
+            try:
+                f.write(line + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+
+    def _log_close(self):
+        f = getattr(self, '_runlog', None)
+        self._runlog = None
+        if f is not None:
+            try:
+                f.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _fmt_combo(combo):
+        return ",".join("%s:%s" % kv for kv in sorted(combo.items()))
 
     # ─── Axis / stepper helpers (same approach as speed_test) ───────
 
@@ -493,6 +541,7 @@ class ChopperTest:
             self._move(axis, end, velocity)
             self._move(axis, start, velocity)
         self.gcode.run_script_from_command("M400")
+        return start, end
 
     def _measure(self, gcmd, axis, velocity, accel, repeat):
         """Run the stress move and report lost steps across a re-home.
@@ -502,26 +551,44 @@ class ChopperTest:
         """
         sample = self._sample_axes(axis)
         before = {a: self._read_mcu_pos(a) for a in sample}
+        t_start = self.reactor.monotonic()
+        geo = None
         try:
             self._set_limits(velocity=velocity * 1.2, accel=accel)
-            self._stress_pattern(axis, velocity, accel, repeat)
+            geo = self._stress_pattern(axis, velocity, accel, repeat)
         finally:
             self.gcode.run_script_from_command("M400")
             # Home and travel must not run at the test acceleration.
             self._restore_limits()
-        self._rehome(axis)
+        t_moved = self.reactor.monotonic()
+        try:
+            self._rehome(axis)
+        except Exception as e:
+            self._log('HOME_FAIL', axis=axis, accel="%.0f" % accel,
+                      error=repr(str(e)))
+            raise
         worst = 0
         got_any = False
+        detail = []
         for a in sample:
             after = self._read_mcu_pos(a)
             if after is None or before.get(a) is None:
+                detail.append("%s:n/a" % a)
                 continue
             got_any = True
             diff = abs(after - before[a])
             thresh = self.max_missed * self._microsteps(a)
-            worst = max(worst, diff if diff > thresh else 0)
+            detail.append("%s:%+d" % (a, after - before[a]))
             if diff > thresh:
                 worst = max(worst, diff)
+        self._log(
+            'MEASURE', axis=axis, v="%.0f" % velocity, a="%.0f" % accel,
+            reps=repeat,
+            move=("%.1f>%.1f" % geo) if geo else "n/a",
+            usteps_after_rehome=",".join(detail),
+            limit="%.0f" % (self.max_missed * self._microsteps(axis)),
+            lost=worst, move_s="%.1f" % (t_moved - t_start),
+            home_s="%.1f" % (self.reactor.monotonic() - t_moved))
         if not got_any:
             raise self.gcode.error(
                 "chopper_test: cannot read the stepper MCU position for "
@@ -543,6 +610,7 @@ class ChopperTest:
         illegal state can exist even for a moment. The same ordering
         protects the toff/tbl pair.
         """
+        self._log('APPLY', combo=self._fmt_combo(combo))
         for stepper, tmc in self._tuned_steppers(axis):
             current = self._read_fields(tmc, combo)
             items = sorted(
@@ -601,6 +669,7 @@ class ChopperTest:
                     "be out of sync, so later candidates can read low.")
             return
         gcmd.respond_info("    lost steps → re-syncing motors (%s)" % how)
+        self._log('RESYNC', how=repr(how))
         live = {}
         for stepper, tmc in self._tuned_steppers(axis):
             live[stepper] = self._read_fields(tmc, self._originals.get(
@@ -613,6 +682,7 @@ class ChopperTest:
             gcmd.respond_info(
                 "    WARNING: re-sync failed (%s) — continuing; later "
                 "candidates may read low." % (e,))
+            self._log('RESYNC_FAIL', error=repr(str(e)))
         self._rehome(axis)
         # Back to the candidate that was being tested.
         for stepper, tmc in self._tuned_steppers(axis):
@@ -649,13 +719,18 @@ class ChopperTest:
         r = self._measure(gcmd, axis, velocity, accel, repeat)
         if not r['failed']:
             r['first_lost'] = 0
+            self._log('VERDICT', result='OK')
             return r
         first = r['lost']
         self._resync_after_loss(gcmd, axis)
+        self._log('RETRY', first_lost=first)
         r = self._measure(gcmd, axis, velocity, accel, repeat)
         if r['failed']:
             self._resync_after_loss(gcmd, axis)
         r['first_lost'] = first
+        self._log('VERDICT',
+                  result='FAIL' if r['failed'] else 'OK_ON_RETRY',
+                  lost=r['lost'], first_lost=first)
         return r
 
     @staticmethod
@@ -949,28 +1024,54 @@ class ChopperTest:
         timestamp = time.strftime('%Y-%m-%d_%H-%M-%S')
         thermal = {}
         self._limits_snapshot = self._snapshot_limits()
+        self._log_open(timestamp)
+        if self._runlog_path:
+            gcmd.respond_info(
+                "  run log (written live): %s" % self._runlog_path)
+        self._log('START', version=MODULE_VERSION, axis=axis, driver=drv,
+                  velocity="%.0f" % velocity, accel="%.0f" % accel,
+                  repeat=repeat, tpfd=do_tpfd, thermal=do_thermal,
+                  structure=self.structure)
+        for n, _tmc in steppers:
+            self._log('STEPPER', name=n,
+                      start=self._fmt_combo(self._originals.get(n, {})))
+        lo_, hi_, _mid, _rng = self._get_axis_bounds(axis)
+        self._log('SETUP', bounds="%.1f..%.1f" % (lo_, hi_),
+                  homes_to_max=self._homes_to_max(axis),
+                  start_offset="%.1f" % self.start_offset,
+                  park=("%s%.1f" % park) if park else "none",
+                  resync=repr(self._resync_plan()[1]),
+                  max_missed=self.max_missed,
+                  limits=self._fmt_combo(self._limits_snapshot or {}))
+        failed_with = None
         try:
             self._prepare(axis)
 
             # Pass 1 — TOFF (dominates the chopper frequency)
+            self._log('PASS', name='Pass 1: TOFF', accel="%.0f" % accel)
             gcmd.respond_info("\n>>> Pass 1: TOFF (chopper off time) <<<")
             v, accel = self._score_candidates(
                 gcmd, axis, 'toff', TOFF_VALUES, best, velocity, accel,
                 repeat, results)
             best['toff'] = v
+            self._log('PICK', field='toff', value=v, accel="%.0f" % accel)
             gcmd.respond_info("  → toff = %s" % v)
 
             # Pass 2 — TBL (comparator blank time)
+            self._log('PASS', name='Pass 2: TBL', accel="%.0f" % accel)
             gcmd.respond_info("\n>>> Pass 2: TBL (blank time) <<<")
             v, accel = self._score_candidates(
                 gcmd, axis, 'tbl', TBL_VALUES, best, velocity, accel,
                 repeat, results)
             best['tbl'] = v
+            self._log('PICK', field='tbl', value=v, accel="%.0f" % accel)
             gcmd.respond_info("  → tbl = %s" % v)
 
             # Pass 3 — hysteresis. hstrt and hend are swept together
             # because only their SUM is constrained and they shape the
             # same regulation window.
+            self._log('PASS', name='Pass 3: HSTRT / HEND',
+                      accel="%.0f" % accel)
             gcmd.respond_info(
                 "\n>>> Pass 3: HSTRT / HEND (hysteresis) <<<")
             pairs = []
@@ -1033,21 +1134,28 @@ class ChopperTest:
                     "hstrt=%d hend=%d"
                     % (len(survivors), survivors[0][0], survivors[0][1]))
             best['hstrt'], best['hend'] = survivors[0]
+            self._log('PICK', field='hstrt/hend',
+                      value="%d/%d" % survivors[0], accel="%.0f" % accel)
             gcmd.respond_info("  → hstrt = %d, hend = %d"
                               % (best['hstrt'], best['hend']))
 
             # Pass 4 — TPFD (5160/2240 only, opt-in)
             if do_tpfd and drv in TPFD_DRIVERS and 'tpfd' in original:
+                self._log('PASS', name='Pass 4: TPFD', accel="%.0f" % accel)
                 gcmd.respond_info(
                     "\n>>> Pass 4: TPFD (passive fast decay) <<<")
                 v, accel = self._score_candidates(
                     gcmd, axis, 'tpfd', TPFD_VALUES, best, velocity,
                     accel, repeat, results)
                 best['tpfd'] = v
+                self._log('PICK', field='tpfd', value=v,
+                          accel="%.0f" % accel)
                 gcmd.respond_info("  → tpfd = %s" % v)
 
             # Thermal shootout: old vs new, same move, same duration.
             if do_thermal:
+                self._log('PASS', name='Thermal',
+                          accel="%.0f" % (accel / 1.3))
                 gcmd.respond_info(
                     "\n>>> Thermal comparison (%.0f s each) <<<"
                     % thermal_s)
@@ -1074,9 +1182,24 @@ class ChopperTest:
                             "  tuned:    %.1f → %.1f °C (+%.1f)"
                             % (probe2['start'], probe2['end'],
                                probe2['rise']))
+        except Exception as e:
+            # Keep what was measured: the run log is already on disk,
+            # and the CSV gets everything up to here.
+            failed_with = e
+            self._log('ERROR', error=repr(str(e)), measured=len(results))
+            self._write_csv(gcmd, timestamp, axis, drv, original, best,
+                            results, thermal, velocity, repeat,
+                            aborted=str(e))
+            raise
         finally:
             # Always hand every driver back exactly as we found it.
-            self._restore_originals(axis)
+            try:
+                self._restore_originals(axis)
+                self._log('RESTORED', steppers=",".join(
+                    n for n, _tmc in steppers))
+            finally:
+                if failed_with is not None:
+                    self._log_close()
 
         changed = {k: v for k, v in best.items() if original.get(k) != v}
         gcmd.respond_info(
@@ -1103,9 +1226,12 @@ class ChopperTest:
                              for k, v in sorted(changed.items()))))
         self._write_csv(gcmd, timestamp, axis, drv, original, best,
                         results, thermal, velocity, repeat)
+        self._log('END', result=self._fmt_combo(best),
+                  changed=self._fmt_combo(changed) or 'nothing')
+        self._log_close()
 
     def _write_csv(self, gcmd, timestamp, axis, drv, original, best,
-                   results, thermal, velocity, repeat):
+                   results, thermal, velocity, repeat, aborted=None):
         try:
             os.makedirs(self.output_dir, exist_ok=True)
             path = os.path.join(self.output_dir,
@@ -1115,6 +1241,9 @@ class ChopperTest:
                 f.write("# Plugin by Steven (Fragmon) — Crydteam\n")
                 f.write("# sweep order adapted from MRX8024/"
                         "chopper-resonance-tuner\n")
+                if aborted:
+                    f.write("# ABORTED — partial results. Error: %s\n"
+                            % aborted.replace("\n", " "))
                 f.write("# axis: %s  driver: %s\n" % (axis, drv))
                 f.write("# steppers tuned: %s\n" % ", ".join(
                     n for n, _ in self._tuned_steppers(axis)))

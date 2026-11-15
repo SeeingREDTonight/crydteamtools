@@ -97,6 +97,11 @@ passed.
   `[speed_test]` values are used.
 - X/Y are always homed before the first measurement, so its reference
   is a homed position.
+- A run log `chopper_<timestamp>.log` is written line by line during
+  the run (setup, every candidate, measurement, retry, re-sync, pick,
+  error) and mirrored to klippy.log; on an error the CSV is still
+  written with the results so far, marked `ABORTED`. Stock wrote
+  nothing unless the run finished.
 - The stress move starts `start_offset` (new option, default 20 % of
   the travel) from the end the axis homes to; stock always used the
   position_min end, far from the endstop on max-homing machines.
