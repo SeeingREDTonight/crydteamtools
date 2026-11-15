@@ -31,7 +31,7 @@ import os
 import time
 
 MODULE_NAME = "Chopper Test"
-MODULE_VERSION = "0.1.0"
+MODULE_VERSION = "0.1.1"
 
 TRINAMIC_DRIVERS = ("tmc2130", "tmc2209", "tmc2240", "tmc5160", "tmc2660")
 # Drivers whose CHOPCONF carries a TPFD field (passive fast decay).
@@ -124,11 +124,22 @@ class ChopperTest:
         self._originals = {}
         self._resync_noted = False
 
+        # CHOPPER_TEST, not CHOPPER_TUNE: that name belongs to the
+        # accelerometer-based chopper-resonance-tuner ([chopper_tune]),
+        # and registering it here took the command over when both
+        # plugins were installed. The old name is kept as an alias only
+        # when no [chopper_tune] section is configured.
+        desc = ('Tune the TMC chopper registers by measured torque '
+                '(lost steps) and motor temperature — no accelerometer '
+                'needed')
         self.gcode.register_command(
-            'CHOPPER_TUNE', self.cmd_CHOPPER_TUNE,
-            desc='Tune the TMC chopper registers by measured torque '
-                 '(lost steps) and motor temperature — no accelerometer '
-                 'needed')
+            'CHOPPER_TEST', self.cmd_CHOPPER_TEST, desc=desc)
+        resonance_tuner = (config.has_section('chopper_tune')
+                           or config.get_prefix_sections('chopper_tune '))
+        if not resonance_tuner:
+            self.gcode.register_command(
+                'CHOPPER_TUNE', self.cmd_CHOPPER_TEST,
+                desc=desc + ' (old name of CHOPPER_TEST)')
         self.gcode.register_command(
             'CHOPPER_TEST_STATUS', self.cmd_STATUS,
             desc='Show the chopper registers of an axis and whether it '
@@ -891,7 +902,7 @@ class ChopperTest:
             return
         drv = info[0]
         lines.append("  driver: %s on %s" % (drv, self._stepper_name(axis)))
-        lines.append("  CHOPPER_TUNE writes candidates to: %s"
+        lines.append("  CHOPPER_TEST writes candidates to: %s"
                      % ", ".join(n for n, _ in self._tuned_steppers(axis)))
         park = self._park_pos(axis)
         if park is not None:
@@ -931,7 +942,7 @@ class ChopperTest:
                         else "not on this driver"))
         gcmd.respond_info("\n".join(lines))
 
-    def cmd_CHOPPER_TUNE(self, gcmd):
+    def cmd_CHOPPER_TEST(self, gcmd):
         axis = gcmd.get('AXIS', self.default_axis).upper()
         if axis not in ('X', 'Y'):
             raise self.gcode.error("chopper_test: AXIS must be X or Y")
@@ -997,7 +1008,7 @@ class ChopperTest:
                 "the settings separate." % accel)
 
         gcmd.respond_info(
-            "──── CHOPPER_TUNE %s ────\n"
+            "──── CHOPPER_TEST %s ────\n"
             "  driver %s | start: %s\n"
             "  candidates are written to: %s\n"
             "  stress: %.0f mm/s, %d out-and-back moves per candidate\n"
