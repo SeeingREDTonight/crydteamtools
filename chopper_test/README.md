@@ -8,6 +8,35 @@ Part of **[Crydteam Tools](../README.md)** · by Steven (Fragmon) — Crydteam �
 
 ---
 
+## Changes in this fork
+
+Full detail: [MODIFICATIONS.md](../MODIFICATIONS.md).
+
+- **Candidates go to every motor that drives the move.** Stock writes
+  each candidate to `stepper_<axis>` only. On CoreXY every X or Y move
+  is driven by both belts, and an AWD machine has two motors per belt,
+  so the untouched motors carried the load and hid bad candidates. Now
+  all `stepper_x*` / `stepper_y*` drivers of the same type get it on
+  CoreXY (on cartesian: all motors of that axis), and each driver gets
+  its own starting values back afterwards.
+- **Re-sync after lost steps** (`skip_resync_gcode`, default `auto`):
+  after a measurement that lost steps, dual-motor belts are re-synced
+  (`SYNC_MOTORS`, else `MOTOR_SYNC`, else a note) on the original
+  settings before the next measurement.
+- **Retries are shown.** A candidate that lost steps and passed its one
+  retry reads `OK on retry (lost N µsteps the first time)` instead of
+  `OK`; the CSV has a `first_try_lost_usteps` column.
+- **No jump to an untested acceleration.** After the last round of a
+  pass the acceleration is no longer raised, so the next pass starts at
+  the highest acceleration that was actually tested (stock started it
+  15 % above).
+- **`park_x` / `park_y`**: the other axis is parked there during the
+  test; falls back to the `[speed_test]` values.
+- X/Y are always re-homed before the first measurement.
+
+`CHOPPER_TEST_STATUS` lists the drivers that will be written, the park
+position and the re-sync method.
+
 ## The idea
 
 The chopper registers (`TOFF`, `TBL`, `HSTRT`, `HEND`, `TPFD`) decide how the

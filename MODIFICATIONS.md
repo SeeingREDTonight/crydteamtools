@@ -57,6 +57,34 @@ Both options are listed (commented out) in `speed_test_settings.cfg`.
 
 ---
 
+## Chopper test (`chopper_test/`)
+
+Stock writes each candidate register value to `stepper_<axis>` only and
+judges it by lost steps after a re-home. On an AWD CoreXY four motors
+drive every X or Y move, so three kept their normal settings and held
+position while the tested one could lose sync audibly — bad candidates
+passed.
+
+- Candidates are written to every motor that drives the move (CoreXY:
+  all `stepper_x*` / `stepper_y*` with the same driver type; cartesian:
+  all motors of the axis). Each driver's own starting values are
+  restored at the end, on errors too, and before a re-sync.
+- `skip_resync_gcode` (default `auto`, as in the speed test): after a
+  measurement that lost steps the dual-motor belts are re-synced before
+  the next one, so later candidates are not tested on an out-of-phase
+  pair.
+- A failed candidate still gets one retry, but the console shows
+  `OK on retry (lost N µsteps the first time)` and the CSV records the
+  first result (`first_try_lost_usteps`). Stock printed a plain `OK`.
+- After the last round of a pass the acceleration is not raised any
+  more. Stock announced a raise, never tested it, and started the next
+  pass at that untested acceleration. If nothing holds in a later round,
+  the next pass starts at the last acceleration where something held.
+- `park_x` / `park_y` park the other axis during the test; unset, the
+  `[speed_test]` values are used.
+- X/Y are always homed before the first measurement, so its reference
+  is a homed position.
+
 ## Flow test (`max_flow_test/`)
 
 ### Why

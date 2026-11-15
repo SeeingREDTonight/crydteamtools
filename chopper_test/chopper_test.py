@@ -71,6 +71,9 @@ TPFD_VALUES = tuple(range(0, 16, 2))
 #             inert while chm=0 and thigh=0, or dcStep-only
 
 SETTLE_DELAY_MS = 200
+# Rounds per pass, and how much the acceleration rises between them.
+ESCALATIONS = 4
+ESCALATION_FACTOR = 1.15
 
 
 class ChopperTest:
@@ -92,6 +95,15 @@ class ChopperTest:
         # "temperature_sensor motor_x". Without it the thermal stage
         # falls back to the driver's own sensor (TMC2240) or is skipped.
         self.motor_sensor = config.get('motor_sensor', '').strip()
+        # Where to park the OTHER axis during a test (e.g. clear of
+        # motor towers). Unset = [speed_test]'s park_x / park_y if that
+        # plugin is loaded, else the axis stays where homing left it.
+        self.park_x = config.getfloat('park_x', None)
+        self.park_y = config.getfloat('park_y', None)
+        # Re-sync of dual-motor (AWD) belt pairs after lost steps:
+        # auto | none | any G-code (same meaning as in [speed_test]).
+        self.skip_resync_gcode = config.get(
+            'skip_resync_gcode', 'auto').strip() or 'auto'
         self.thermal_seconds = config.getfloat(
             'thermal_seconds', 90.0, minval=10.)
 
@@ -102,7 +114,10 @@ class ChopperTest:
             'output_dir', os.path.join(config_dir, 'Choppertest')))
 
         self._tmc_cache = {}
+        self._tuned_cache = {}
         self._limits_snapshot = None
+        self._originals = {}
+        self._resync_noted = False
 
         self.gcode.register_command(
             'CHOPPER_TUNE', self.cmd_CHOPPER_TUNE,
@@ -181,18 +196,62 @@ class ChopperTest:
         except Exception:
             return None
 
-    def _set_field(self, axis, name, value):
+    def _tuned_steppers(self, axis):
+        """Every stepper that drives a move on `axis` and has the same
+        TMC driver type as stepper_<axis>: [(stepper name, tmc), …].
+
+        A candidate has to reach all of them. On CoreXY every X or Y
+        move is driven by both belts, and an AWD machine has two motors
+        per belt (stepper_x, stepper_x1, stepper_y, stepper_y1): with
+        the candidate on one driver only, the other motors keep their
+        old settings, carry the load and hide a bad candidate.
+        """
+        if axis in self._tuned_cache:
+            return self._tuned_cache[axis]
+        primary = self._stepper_name(axis)
+        info = self._lookup_tmc(axis)
+        out = []
+        if info:
+            prefixes = (('stepper_x', 'stepper_y')
+                        if self.structure == 'corexy' else (primary,))
+            names = [primary]
+            try:
+                kin = self.printer.lookup_object('toolhead').get_kinematics()
+                for st in kin.get_steppers():
+                    n = st.get_name()
+                    if n not in names and n.startswith(prefixes):
+                        names.append(n)
+            except Exception:
+                pass
+            for n in names:
+                tmc = self.printer.lookup_object(
+                    "%s %s" % (info[0], n), None)
+                if tmc is not None:
+                    out.append((n, tmc))
+        self._tuned_cache[axis] = out
+        return out
+
+    def _read_fields(self, tmc, names):
+        vals = {}
+        for n in names:
+            try:
+                vals[n] = tmc.fields.get_field(n)
+            except Exception:
+                pass
+        return vals
+
+    def _set_stepper_field(self, stepper, name, value):
         """Write through Klipper's own SET_TMC_FIELD: it validates the
         field, quantises the value and schedules the write at a print
         time, which a raw register write does not."""
         try:
             self.gcode.run_script_from_command(
                 "SET_TMC_FIELD STEPPER=%s FIELD=%s VALUE=%d"
-                % (self._stepper_name(axis), name, int(value)))
+                % (stepper, name, int(value)))
             return True
         except Exception as e:
-            logging.warning("chopper_test: SET_TMC_FIELD %s=%s failed: %s",
-                            name, value, e)
+            logging.warning("chopper_test: SET_TMC_FIELD %s %s=%s failed: "
+                            "%s", stepper, name, value, e)
             return False
 
     def _stealthchop_max_velocity(self, axis):
@@ -334,13 +393,15 @@ class ChopperTest:
         """
         kin = self.printer.lookup_object('toolhead').get_kinematics()
         homed = kin.get_status(self.reactor.monotonic())['homed_axes']
-        need = [a for a in tuple(self._sample_axes(axis)) + ('Z',)
-                if a.lower() not in homed]
-        if need:
-            self.gcode.run_script_from_command("G28 %s" % " ".join(need))
+        if 'z' not in homed:
+            self.gcode.run_script_from_command("G28")
         self.gcode.run_script_from_command(
             "G90\nG1 Z%.3f F%.0f\nM400"
             % (self.z_pos, max(60.0, self.travel_speed * 60.0)))
+        # The first measurement compares against the position right
+        # after a home, so X/Y are always homed here — also when they
+        # already were, because the toolhead may be anywhere.
+        self._rehome(axis)
 
     def _rehome(self, axis):
         """Re-home UNCONDITIONALLY.
@@ -355,6 +416,29 @@ class ChopperTest:
         self.gcode.run_script_from_command(
             "G28 %s\nM400" % " ".join(self._sample_axes(axis)))
 
+    def _park_pos(self, axis):
+        """(other axis, position) to park at during a test on `axis`,
+        or None. Own park_x / park_y first, then [speed_test]'s."""
+        other = 'Y' if axis == 'X' else 'X'
+        attr = 'park_' + other.lower()
+        pos = getattr(self, attr, None)
+        if pos is None:
+            st = self.printer.lookup_object('speed_test', None)
+            pos = getattr(st, attr, None) if st is not None else None
+        if pos is None:
+            return None
+        try:
+            lo, hi, _, _ = self._get_axis_bounds(other)
+            pos = min(max(float(pos), lo), hi)
+        except Exception:
+            return None
+        return other, pos
+
+    def _park_other(self, axis):
+        park = self._park_pos(axis)
+        if park is not None:
+            self._move(park[0], park[1], self.travel_speed)
+
     def _stress_pattern(self, axis, velocity, accel, repeat):
         """Out-and-back that just reaches V, plus a short cruise. Same
         shape speed_test uses for its fast stall probe: it is the
@@ -368,6 +452,7 @@ class ChopperTest:
         if end > hi:
             end = hi
             start = max(lo, end - dist)
+        self._park_other(axis)
         self._move(axis, start, self.travel_speed)
         for _ in range(repeat):
             self._move(axis, end, velocity)
@@ -423,16 +508,130 @@ class ChopperTest:
         illegal state can exist even for a moment. The same ordering
         protects the toff/tbl pair.
         """
-        current = {n: self._field(axis, n) for n in combo}
-        items = sorted(
-            combo.items(),
-            key=lambda kv: 0 if (current.get(kv[0]) is not None
-                                 and kv[1] <= current[kv[0]]) else 1)
-        for name, value in items:
-            if current.get(name) == value:
-                continue          # already there — skip the round trip
-            self._set_field(axis, name, value)
+        for stepper, tmc in self._tuned_steppers(axis):
+            current = self._read_fields(tmc, combo)
+            items = sorted(
+                combo.items(),
+                key=lambda kv: 0 if (current.get(kv[0]) is not None
+                                     and kv[1] <= current[kv[0]]) else 1)
+            for name, value in items:
+                if current.get(name) == value:
+                    continue      # already there — skip the round trip
+                self._set_stepper_field(stepper, name, value)
         self.gcode.run_script_from_command("G4 P%d" % SETTLE_DELAY_MS)
+
+    # ─── Re-sync of dual-motor belts after lost steps ───────────────
+
+    def _resync_plan(self):
+        """(gcode or None, description) — same choice as speed_test."""
+        cfg = self.skip_resync_gcode
+        if cfg.lower() in ('none', 'off', 'false', '0'):
+            return None, 'disabled'
+        if cfg.lower() != 'auto':
+            return cfg, 'configured G-code'
+        axes = []
+        try:
+            kin = self.printer.lookup_object('toolhead').get_kinematics()
+            names = [st.get_name() for st in kin.get_steppers()]
+        except Exception:
+            names = []
+        for ax in ('x', 'y'):
+            base = 'stepper_' + ax
+            if sum(1 for n in names if n.startswith(base)) > 1:
+                axes.append(ax.upper())
+        if not axes:
+            return None, 'single-motor axes'
+        if self.printer.lookup_object('motors_sync', None) is not None:
+            return 'SYNC_MOTORS', 'accelerometer sync (motors_sync)'
+        if self.printer.lookup_object('motor_sync', None) is not None:
+            return ('\n'.join('MOTOR_SYNC AXIS=%s' % a for a in axes),
+                    'StallGuard sync (motor_sync)')
+        return None, 'unavailable'
+
+    def _resync_after_loss(self, gcmd, axis):
+        """Lost steps can leave the two motors of a belt out of phase,
+        and homing does not fix that — every later candidate would then
+        be tested on a weaker pair. Runs with the candidate still on the
+        drivers put aside: the sync is done on the settings the run
+        started with. Re-homes afterwards (the sync moves the toolhead).
+        """
+        script, how = self._resync_plan()
+        if script is None:
+            if how == 'unavailable' and not self._resync_noted:
+                self._resync_noted = True
+                gcmd.respond_info(
+                    "    NOTE: lost steps on a dual-motor axis, but no "
+                    "motor sync is available (no [motors_sync] or "
+                    "[motor_sync]). The motors of a belt pair may now "
+                    "be out of sync, so later candidates can read low.")
+            return
+        gcmd.respond_info("    lost steps → re-syncing motors (%s)" % how)
+        live = {}
+        for stepper, tmc in self._tuned_steppers(axis):
+            live[stepper] = self._read_fields(tmc, self._originals.get(
+                stepper, {}))
+        self._restore_originals(axis)
+        try:
+            self.gcode.run_script_from_command(script)
+            self.gcode.run_script_from_command("M400")
+        except self.gcode.error as e:
+            gcmd.respond_info(
+                "    WARNING: re-sync failed (%s) — continuing; later "
+                "candidates may read low." % (e,))
+        self._rehome(axis)
+        # Back to the candidate that was being tested.
+        for stepper, tmc in self._tuned_steppers(axis):
+            want = live.get(stepper) or {}
+            cur = self._read_fields(tmc, want)
+            for name, value in sorted(
+                    want.items(),
+                    key=lambda kv: 0 if kv[1] <= cur.get(kv[0], kv[1])
+                    else 1):
+                if cur.get(name) != value:
+                    self._set_stepper_field(stepper, name, value)
+        self.gcode.run_script_from_command("G4 P%d" % SETTLE_DELAY_MS)
+
+    def _restore_originals(self, axis):
+        """Every tuned driver back to what it had when the run began,
+        decreases first (see _apply)."""
+        for stepper, tmc in self._tuned_steppers(axis):
+            orig = self._originals.get(stepper) or {}
+            cur = self._read_fields(tmc, orig)
+            for name, value in sorted(
+                    orig.items(),
+                    key=lambda kv: 0 if kv[1] <= cur.get(kv[0], kv[1])
+                    else 1):
+                if cur.get(name) != value:
+                    self._set_stepper_field(stepper, name, value)
+        self.gcode.run_script_from_command("G4 P%d" % SETTLE_DELAY_MS)
+
+    def _measure_scored(self, gcmd, axis, velocity, accel, repeat):
+        """_measure plus the one retry a failed candidate gets ('one
+        noisy fail must not condemn a setting'), with a motor re-sync
+        after every measurement that lost steps. The first result is
+        kept in 'first_lost' so a retried pass is never shown as a
+        clean one."""
+        r = self._measure(gcmd, axis, velocity, accel, repeat)
+        if not r['failed']:
+            r['first_lost'] = 0
+            return r
+        first = r['lost']
+        self._resync_after_loss(gcmd, axis)
+        r = self._measure(gcmd, axis, velocity, accel, repeat)
+        if r['failed']:
+            self._resync_after_loss(gcmd, axis)
+        r['first_lost'] = first
+        return r
+
+    @staticmethod
+    def _verdict(r):
+        if r['failed']:
+            return "lost %d µsteps (and %d on the first try)" % (
+                r['lost'], r['first_lost'])
+        if r.get('first_lost'):
+            return "OK on retry (lost %d µsteps the first time)" % (
+                r['first_lost'])
+        return "OK"
 
     def _score_candidates(self, gcmd, axis, field, values, base,
                           velocity, accel, repeat, results):
@@ -448,55 +647,54 @@ class ChopperTest:
         """
         candidates = list(values)
         cur_accel = accel
-        for escalation in range(4):
+        for escalation in range(ESCALATIONS):
             survivors = []
             for v in candidates:
                 combo = dict(base)
                 combo[field] = v
                 self._apply(axis, combo)
-                r = self._measure(gcmd, axis, velocity, cur_accel, repeat)
-                if r['failed']:
-                    # One noisy fail must not condemn a setting.
-                    r2 = self._measure(gcmd, axis, velocity, cur_accel,
-                                       repeat)
-                    if not r2['failed']:
-                        r = r2
-                        r['retested'] = True
+                r = self._measure_scored(gcmd, axis, velocity, cur_accel,
+                                         repeat)
                 results.append({
                     'field': field, 'value': v, 'accel': cur_accel,
                     'lost': r['lost'], 'failed': r['failed'],
-                    'base': dict(base),
+                    'first_lost': r['first_lost'], 'base': dict(base),
                 })
                 gcmd.respond_info(
                     "    %s=%-3s @ %.0f mm/s²  →  %s"
-                    % (field, v, cur_accel,
-                       "lost %d µsteps" % r['lost'] if r['failed']
-                       else "OK"))
+                    % (field, v, cur_accel, self._verdict(r)))
                 if not r['failed']:
                     survivors.append(v)
             if len(survivors) == 1:
                 return survivors[0], cur_accel
             if not survivors:
-                # Nothing held: take the value that lost the least.
+                # Nothing held: take the value that lost the least, and
+                # hand the next pass the last acceleration at which
+                # something still held (if there was one).
                 rows = [x for x in results
                         if x['field'] == field and x['accel'] == cur_accel]
                 best = min(rows, key=lambda x: x['lost'])
-                return best['value'], cur_accel
-            # Several held — raise the bar and let them fight it out.
+                return best['value'], (cur_accel / ESCALATION_FACTOR
+                                       if escalation else cur_accel)
             candidates = survivors
-            cur_accel *= 1.15
+            if escalation == ESCALATIONS - 1:
+                break
+            # Several held — raise the bar and let them fight it out.
+            cur_accel *= ESCALATION_FACTOR
             gcmd.respond_info(
                 "    %d values held — raising to %.0f mm/s² to separate "
                 "them" % (len(survivors), cur_accel))
-        # Still tied after the last escalation: this pass could not
-        # separate the values. Never invent a winner from list order —
-        # keep what the printer already ran unless it is not among the
-        # survivors, and say so.
+        # Still tied after the last round: this pass could not separate
+        # the values. Never invent a winner from list order — keep what
+        # the printer already ran unless it is not among the survivors.
+        # cur_accel is the last acceleration that was actually tested;
+        # the next pass starts there, not above it.
         incumbent = base.get(field)
         keep = incumbent if incumbent in candidates else candidates[0]
         gcmd.respond_info(
-            "    inconclusive — %d values still hold at %.0f mm/s²; "
-            "keeping %s=%s" % (len(candidates), cur_accel, field, keep))
+            "    inconclusive — %d values still hold at %.0f mm/s² (the "
+            "highest tested); keeping %s=%s"
+            % (len(candidates), cur_accel, field, keep))
         return keep, cur_accel
 
     # ─── Thermal comparison ─────────────────────────────────────────
@@ -538,11 +736,15 @@ class ChopperTest:
         t0, source = self._read_motor_temp(axis)
         if t0 is None:
             return None
-        self._apply(axis, combo)
+        if combo is None:
+            self._restore_originals(axis)   # each driver's own values
+        else:
+            self._apply(axis, combo)
         lo, hi, mid, rng = self._get_axis_bounds(axis)
         dist = min(rng, max(20.0, (velocity ** 2) / accel + 0.2 * velocity))
         start = mid - dist / 2.0
         end = mid + dist / 2.0
+        self._park_other(axis)
         self._move(axis, start, self.travel_speed)
         self.gcode.run_script_from_command("M400")
         deadline = self.reactor.monotonic() + seconds
@@ -579,6 +781,14 @@ class ChopperTest:
             return
         drv = info[0]
         lines.append("  driver: %s on %s" % (drv, self._stepper_name(axis)))
+        lines.append("  CHOPPER_TUNE writes candidates to: %s"
+                     % ", ".join(n for n, _ in self._tuned_steppers(axis)))
+        park = self._park_pos(axis)
+        if park is not None:
+            lines.append("  %s parked at %.1f during the test"
+                         % (park[0], park[1]))
+        lines.append("  re-sync after lost steps: %s"
+                     % self._resync_plan()[1])
         limit = self._stealthchop_max_velocity(axis)
         en_pwm = self._field(axis, 'en_pwm_mode')
         if en_pwm == 0 or (en_pwm is None
@@ -658,6 +868,16 @@ class ChopperTest:
                 "chopper_test: cannot read the chopper registers of %s."
                 % drv)
 
+        # Every motor that drives this move gets the candidates, and
+        # each one is handed back exactly what it had.
+        steppers = self._tuned_steppers(axis)
+        self._originals = {n: self._read_fields(tmc, fields)
+                           for n, tmc in steppers}
+        self._resync_noted = False
+        differing = [n for n, _ in steppers
+                     if any(self._originals[n].get(f) != v
+                            for f, v in original.items())]
+
         if accel <= 0:
             _, _, _, rng = self._get_axis_bounds(axis)
             accel = max(1000.0, (velocity ** 2) / max(5.0, rng * 0.25))
@@ -669,13 +889,25 @@ class ChopperTest:
         gcmd.respond_info(
             "──── CHOPPER_TUNE %s ────\n"
             "  driver %s | start: %s\n"
+            "  candidates are written to: %s\n"
             "  stress: %.0f mm/s, %d out-and-back moves per candidate\n"
             "  scoring: lost steps (torque)%s\n"
             "  every register is restored when the run ends."
             % (axis, drv,
                " ".join("%s=%s" % kv for kv in sorted(original.items())),
+               ", ".join(n for n, _ in steppers),
                velocity, repeat,
                " + motor temperature" if do_thermal else ""))
+        if differing:
+            gcmd.respond_info(
+                "  NOTE: %s start(s) with different chopper values than "
+                "%s. They get the same candidates during the test and "
+                "their own values back afterwards."
+                % (", ".join(differing), self._stepper_name(axis)))
+        park = self._park_pos(axis)
+        if park is not None:
+            gcmd.respond_info("  %s is parked at %.1f during the test."
+                              % (park[0], park[1]))
 
         results = []
         best = dict(original)
@@ -714,29 +946,24 @@ class ChopperTest:
             hyst_results = []
             cur_accel = accel
             survivors = pairs
-            for _ in range(4):
+            for rnd in range(ESCALATIONS):
                 held = []
                 for hs, he in survivors:
                     combo = dict(best)
                     combo['hstrt'] = hs
                     combo['hend'] = he
                     self._apply(axis, combo)
-                    r = self._measure(gcmd, axis, velocity, cur_accel,
-                                      repeat)
-                    if r['failed']:
-                        r2 = self._measure(gcmd, axis, velocity,
-                                           cur_accel, repeat)
-                        if not r2['failed']:
-                            r = r2
+                    r = self._measure_scored(gcmd, axis, velocity,
+                                             cur_accel, repeat)
                     hyst_results.append({
                         'field': 'hstrt/hend', 'value': '%d/%d' % (hs, he),
                         'accel': cur_accel, 'lost': r['lost'],
-                        'failed': r['failed'], 'base': dict(best)})
+                        'failed': r['failed'],
+                        'first_lost': r['first_lost'],
+                        'base': dict(best)})
                     gcmd.respond_info(
                         "    hstrt=%d hend=%-2d @ %.0f mm/s²  →  %s"
-                        % (hs, he, cur_accel,
-                           "lost %d µsteps" % r['lost'] if r['failed']
-                           else "OK"))
+                        % (hs, he, cur_accel, self._verdict(r)))
                     if not r['failed']:
                         held.append((hs, he))
                 if len(held) == 1:
@@ -748,9 +975,13 @@ class ChopperTest:
                     bestrow = min(rows, key=lambda x: x['lost'])
                     hs, he = [int(x) for x in bestrow['value'].split('/')]
                     survivors = [(hs, he)]
+                    if rnd:
+                        cur_accel /= ESCALATION_FACTOR
                     break
                 survivors = held
-                cur_accel *= 1.15
+                if rnd == ESCALATIONS - 1:
+                    break
+                cur_accel *= ESCALATION_FACTOR
                 gcmd.respond_info(
                     "    %d pairs held — raising to %.0f mm/s²"
                     % (len(held), cur_accel))
@@ -785,7 +1016,7 @@ class ChopperTest:
                 gcmd.respond_info(
                     "\n>>> Thermal comparison (%.0f s each) <<<"
                     % thermal_s)
-                probe = self._thermal_run(gcmd, axis, original, velocity,
+                probe = self._thermal_run(gcmd, axis, None, velocity,
                                           accel / 1.3, thermal_s)
                 if probe is None:
                     gcmd.respond_info(
@@ -809,10 +1040,8 @@ class ChopperTest:
                             % (probe2['start'], probe2['end'],
                                probe2['rise']))
         finally:
-            # Always hand the driver back exactly as we found it.
-            for f, v in original.items():
-                self._set_field(axis, f, v)
-            self.gcode.run_script_from_command("G4 P%d" % SETTLE_DELAY_MS)
+            # Always hand every driver back exactly as we found it.
+            self._restore_originals(axis)
 
         changed = {k: v for k, v in best.items() if original.get(k) != v}
         gcmd.respond_info(
@@ -832,8 +1061,9 @@ class ChopperTest:
         if changed:
             gcmd.respond_info(
                 "  The registers are back on their original values. To "
-                "keep the result, add to [%s %s]:\n%s"
-                % (drv, self._stepper_name(axis),
+                "keep the result, add to %s:\n%s"
+                % (" and ".join("[%s %s]" % (drv, n)
+                                for n, _ in steppers),
                    "\n".join("    driver_%s: %s" % (k.upper(), v)
                              for k, v in sorted(changed.items()))))
         self._write_csv(gcmd, timestamp, axis, drv, original, best,
@@ -851,6 +1081,8 @@ class ChopperTest:
                 f.write("# sweep order adapted from MRX8024/"
                         "chopper-resonance-tuner\n")
                 f.write("# axis: %s  driver: %s\n" % (axis, drv))
+                f.write("# steppers tuned: %s\n" % ", ".join(
+                    n for n, _ in self._tuned_steppers(axis)))
                 f.write("# stress: %.0f mm/s, %d moves per candidate\n"
                         % (velocity, repeat))
                 f.write("# before: %s\n" % " ".join(
@@ -861,11 +1093,12 @@ class ChopperTest:
                     f.write("# thermal_%s: %.1f -> %.1f C (+%.1f) via %s\n"
                             % (key, t['start'], t['end'], t['rise'],
                                t['source']))
-                f.write("field,value,accel_mm_s2,lost_usteps,failed,base\n")
+                f.write("field,value,accel_mm_s2,lost_usteps,failed,"
+                        "first_try_lost_usteps,base\n")
                 for r in results:
-                    f.write("%s,%s,%.0f,%d,%d,%s\n" % (
+                    f.write("%s,%s,%.0f,%d,%d,%d,%s\n" % (
                         r['field'], r['value'], r['accel'], r['lost'],
-                        1 if r['failed'] else 0,
+                        1 if r['failed'] else 0, r.get('first_lost', 0),
                         " ".join("%s=%s" % kv
                                  for kv in sorted(r['base'].items()))))
             gcmd.respond_info("  CSV saved: %s" % path)
