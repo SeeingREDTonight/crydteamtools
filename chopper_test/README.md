@@ -108,11 +108,18 @@ Then uncomment `[chopper_test]` in `chopper_test_settings.cfg` and
 
 ```
 CHOPPER_TEST_STATUS [AXIS=X]      # check first: driver, mode, registers
-CHOPPER_TUNE [AXIS=X] [VELOCITY=200] [ACCEL=0] [REPEAT=8]
+CHOPPER_TEST [AXIS=X] [VELOCITY=200] [ACCEL=0] [REPEAT=8]
              [TPFD=0] [THERMAL=1] [THERMAL_SECONDS=90]
 ```
 
 (UI macros `CT_STATUS` / `CT_TUNE`)
+
+The command was called `CHOPPER_TUNE` before. That name belongs to the
+accelerometer-based
+[chopper-resonance-tuner](https://github.com/eoyilmaz/chopper-resonance-tuner)
+(`[chopper_tune]`), so this plugin now uses `CHOPPER_TEST` and both can
+be installed side by side. `CHOPPER_TUNE` still works as an alias here
+when no `[chopper_tune]` section is configured.
 
 | Parameter | Default | Meaning |
 |---|---|---|

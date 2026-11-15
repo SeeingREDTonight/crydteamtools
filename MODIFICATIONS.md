@@ -105,6 +105,11 @@ passed.
 - The stress move starts `start_offset` (new option, default 20 % of
   the travel) from the end the axis homes to; stock always used the
   position_min end, far from the endstop on max-homing machines.
+- The tuning command is `CHOPPER_TEST` (stock: `CHOPPER_TUNE`, the same
+  name the accelerometer-based chopper-resonance-tuner registers, so
+  installing both left only one of them reachable). `CHOPPER_TUNE`
+  stays as an alias when no `[chopper_tune]` section is configured;
+  the `CT_TUNE` macro calls `CHOPPER_TEST`.
 
 ## Flow test (`max_flow_test/`)
 
