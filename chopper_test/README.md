@@ -32,6 +32,9 @@ Full detail: [MODIFICATIONS.md](../MODIFICATIONS.md).
   15 % above).
 - **`park_x` / `park_y`**: the other axis is parked there during the
   test; falls back to the `[speed_test]` values.
+- **Moves run next to the endstop**: the stress move starts
+  `start_offset` (new option; default 20 % of the travel) from the end
+  the axis homes to. Stock always started from the position_min end.
 - X/Y are always re-homed before the first measurement.
 
 `CHOPPER_TEST_STATUS` lists the drivers that will be written, the park

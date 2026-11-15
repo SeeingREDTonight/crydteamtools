@@ -55,6 +55,12 @@ folder is archived. Uninstall removes the folder once it is empty.
 
 Both options are listed (commented out) in `speed_test_settings.cfg`.
 
+`start_offset` (stock option) is now measured from the end the axis
+homes to. Stock measured it from position_min although it is documented
+as the distance from the endstop, so on max-homing machines the fast
+probe ran at the far end and crossed the bed to re-home after every
+step.
+
 ---
 
 ## Chopper test (`chopper_test/`)
@@ -84,6 +90,9 @@ passed.
   `[speed_test]` values are used.
 - X/Y are always homed before the first measurement, so its reference
   is a homed position.
+- The stress move starts `start_offset` (new option, default 20 % of
+  the travel) from the end the axis homes to; stock always used the
+  position_min end, far from the endstop on max-homing machines.
 
 ## Flow test (`max_flow_test/`)
 

@@ -26,6 +26,11 @@ It pushes a motor until it loses steps, then narrows in on the safe limit with a
 >   motors may now be out of sync. `none` = off; any other value is run
 >   as your own G-code.
 >
+> - **`start_offset` follows the endstop.** The fast probe starts
+>   `start_offset` from the end the axis homes to. Stock measured it
+>   from position_min, so on max-homing machines every step ran at the
+>   far end and crossed the bed to re-home.
+>
 > Both options are listed (commented out) in `speed_test_settings.cfg`.
 > Existing installs keep their settings file, so copy the lines you
 > want from the template in this folder. Usage and examples:

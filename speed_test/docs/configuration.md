@@ -13,7 +13,9 @@ z_pos: 20                     # Z height during XY tests
 monitor_tmc: True             # poll TMC StallGuard during moves
 testbench: False              # see "Testbench mode" below
 start_offset: 0               # mm from the endstop where the search probes
-                              # start. 0 = automatic (20% of usable travel).
+                              # start, on top of `margin`, measured from
+                              # the end the axis homes to (min or max).
+                              # 0 = automatic (20% of usable travel).
 travel_speed: 100             # mm/s for positioning moves to a test's start
 travel_accel: 3000            # mm/s^2 for those positioning moves
 max_missed: 1.5               # skip tolerance, in FULL motor steps. A move

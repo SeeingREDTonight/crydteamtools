@@ -98,6 +98,9 @@ class ChopperTest:
         # Where to park the OTHER axis during a test (e.g. clear of
         # motor towers). Unset = [speed_test]'s park_x / park_y if that
         # plugin is loaded, else the axis stays where homing left it.
+        # Distance from the endstop where the stress move starts.
+        # 0 = automatic (20 % of the usable travel).
+        self.start_offset = config.getfloat('start_offset', 0.0, minval=0.)
         self.park_x = config.getfloat('park_x', None)
         self.park_y = config.getfloat('park_y', None)
         # Re-sync of dual-motor (AWD) belt pairs after lost steps:
@@ -416,6 +419,26 @@ class ChopperTest:
         self.gcode.run_script_from_command(
             "G28 %s\nM400" % " ".join(self._sample_axes(axis)))
 
+    def _homes_to_max(self, axis):
+        """True when `axis` (X/Y) homes at its high end.
+
+        Read from the stepper config: homing_positive_dir when given,
+        otherwise whichever end position_endstop is nearer to (Klipper's
+        own default rule)."""
+        if axis.upper() not in ('X', 'Y'):
+            return False
+        try:
+            cfg = self.printer.lookup_object('configfile')
+            st = cfg.get_status(self.reactor.monotonic())['settings'][
+                'stepper_' + axis.lower()]
+            pd = st.get('homing_positive_dir')
+            if pd is not None:
+                return str(pd).strip().lower() in ('true', '1', 'yes')
+            lo, hi = float(st['position_min']), float(st['position_max'])
+            return float(st['position_endstop']) > (lo + hi) / 2.0
+        except Exception:
+            return False
+
     def _park_pos(self, axis):
         """(other axis, position) to park at during a test on `axis`,
         or None. Own park_x / park_y first, then [speed_test]'s."""
@@ -447,11 +470,23 @@ class ChopperTest:
         lo, hi, mid, rng = self._get_axis_bounds(axis)
         dist = (velocity ** 2) / accel + 0.05 * velocity
         dist = max(5.0, min(dist, rng))
-        start = lo + 0.20 * rng
-        end = start + dist
-        if end > hi:
-            end = hi
-            start = max(lo, end - dist)
+        # `start` is the end of the move nearest the endstop; the offset
+        # is measured from the end the axis HOMES to, so the re-home
+        # after every candidate is a short trip.
+        offset = (min(self.start_offset, 0.8 * rng)
+                  if self.start_offset > 0 else 0.20 * rng)
+        if self._homes_to_max(axis):
+            start = hi - offset
+            end = start - dist
+            if end < lo:
+                end = lo
+                start = min(hi, end + dist)
+        else:
+            start = lo + offset
+            end = start + dist
+            if end > hi:
+                end = hi
+                start = max(lo, end - dist)
         self._park_other(axis)
         self._move(axis, start, self.travel_speed)
         for _ in range(repeat):

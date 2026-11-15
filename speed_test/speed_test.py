@@ -178,6 +178,26 @@ class SpeedTest:
         ax_max -= margin
         return ax_min, ax_max, (ax_min + ax_max) / 2.0, ax_max - ax_min
 
+    def _homes_to_max(self, axis):
+        """True when `axis` (X/Y) homes at its high end.
+
+        Read from the stepper config: homing_positive_dir when given,
+        otherwise whichever end position_endstop is nearer to (Klipper's
+        own default rule)."""
+        if axis.upper() not in ('X', 'Y'):
+            return False
+        try:
+            cfg = self.printer.lookup_object('configfile')
+            st = cfg.get_status(self.reactor.monotonic())['settings'][
+                'stepper_' + axis.lower()]
+            pd = st.get('homing_positive_dir')
+            if pd is not None:
+                return str(pd).strip().lower() in ('true', '1', 'yes')
+            lo, hi = float(st['position_min']), float(st['position_max'])
+            return float(st['position_endstop']) > (lo + hi) / 2.0
+        except Exception:
+            return False
+
     def _get_microsteps(self, axis):
         stepper = 'stepper_' + axis.lower()
         try:
@@ -489,15 +509,26 @@ class SpeedTest:
         dist = max(5.0, min(dist, ax_range))
         offset = (min(self.start_offset, 0.8 * ax_range)
                   if self.start_offset > 0 else 0.20 * ax_range)
-        low = ax_min + offset
-        high = low + dist
-        if high > ax_max:
-            high = ax_max
-            low = max(ax_min, high - dist)
-        self._park_with_zlift(axis, low, velocity, testbench)
+        # `near` is the end of the move closest to the endstop, `far`
+        # the other one. The offset is measured from the end the axis
+        # HOMES to (not from position_min), so the re-home after every
+        # step is a short trip on max-homing machines too.
+        if self._homes_to_max(axis) and not testbench:
+            near = ax_max - offset
+            far = near - dist
+            if far < ax_min:
+                far = ax_min
+                near = min(ax_max, far + dist)
+        else:
+            near = ax_min + offset
+            far = near + dist
+            if far > ax_max:
+                far = ax_max
+                near = max(ax_min, far - dist)
+        self._park_with_zlift(axis, near, velocity, testbench)
         for _ in range(repeat):
-            self._move_to_axis(axis, high, velocity)
-            self._move_to_axis(axis, low, velocity)
+            self._move_to_axis(axis, far, velocity)
+            self._move_to_axis(axis, near, velocity)
         self.gcode.run_script_from_command("M400")
 
     def _build_print_sim_moves(self, axis, velocity, accel, n_infill,
