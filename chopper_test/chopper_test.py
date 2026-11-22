@@ -636,8 +636,14 @@ class ChopperTest:
 
     # ─── Re-sync of dual-motor belts after lost steps ───────────────
 
-    def _resync_plan(self):
-        """(gcode or None, description) — same choice as speed_test."""
+    def _resync_plan(self, axis=None):
+        """(gcode or None, description) — same choice as speed_test.
+
+        With an axis on a cartesian machine, only that axis counts: a
+        skip on single-motor X says nothing about the Y pair, so it
+        must not trigger MOTOR_SYNC Y. CoreXY moves both belts, so both
+        axes still count there.
+        """
         cfg = self.skip_resync_gcode
         if cfg.lower() in ('none', 'off', 'false', '0'):
             return None, 'disabled'
@@ -650,6 +656,9 @@ class ChopperTest:
         except Exception:
             names = []
         for ax in ('x', 'y'):
+            if (axis is not None and self.structure != 'corexy'
+                    and ax != axis.lower()):
+                continue
             base = 'stepper_' + ax
             if sum(1 for n in names if n.startswith(base)) > 1:
                 axes.append(ax.upper())
@@ -669,7 +678,7 @@ class ChopperTest:
         drivers put aside: the sync is done on the settings the run
         started with. Re-homes afterwards (the sync moves the toolhead).
         """
-        script, how = self._resync_plan()
+        script, how = self._resync_plan(axis)
         if script is None:
             if how == 'unavailable' and not self._resync_noted:
                 self._resync_noted = True
@@ -909,7 +918,7 @@ class ChopperTest:
             lines.append("  %s parked at %.1f during the test"
                          % (park[0], park[1]))
         lines.append("  re-sync after lost steps: %s"
-                     % self._resync_plan()[1])
+                     % self._resync_plan(axis)[1])
         limit = self._stealthchop_max_velocity(axis)
         en_pwm = self._field(axis, 'en_pwm_mode')
         if en_pwm == 0 or (en_pwm is None
@@ -1051,7 +1060,7 @@ class ChopperTest:
                   homes_to_max=self._homes_to_max(axis),
                   start_offset="%.1f" % self.start_offset,
                   park=("%s%.1f" % park) if park else "none",
-                  resync=repr(self._resync_plan()[1]),
+                  resync=repr(self._resync_plan(axis)[1]),
                   max_missed=self.max_missed,
                   limits=self._fmt_combo(self._limits_snapshot or {}))
         failed_with = None

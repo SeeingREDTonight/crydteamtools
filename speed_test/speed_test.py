@@ -851,7 +851,8 @@ class SpeedTest:
 
         failed = bool(skips)
         if failed and not testbench and not self._z_test:
-            self._resync_after_skip(gcmd)
+            self._resync_after_skip(
+                gcmd, [str(a).upper() for a, _ in skips])
         max_diff = max((d for _, d in skips), default=0)
         skip_axes = ",".join(a for a, _ in skips)
         # On a failure, show the raw counters. A loss that equals the
@@ -908,14 +909,21 @@ class SpeedTest:
                     axes.append(ax.upper())
         return axes
 
-    def _resync_plan(self):
-        """(gcode or None, description) for the post-skip re-sync."""
+    def _resync_plan(self, skipped=None):
+        """(gcode or None, description) for the post-skip re-sync.
+
+        With the axes that skipped given, on a cartesian machine only
+        those count: a skip on single-motor X says nothing about the Y
+        pair. CoreXY moves both belts, so every pair still counts.
+        """
         cfg = self.skip_resync_gcode
         if cfg.lower() in ('none', 'off', 'false', '0'):
             return None, 'disabled'
         if cfg and cfg.lower() != 'auto':
             return cfg, 'configured G-code'
         axes = self._dual_motor_axes()
+        if skipped is not None and self.structure != 'corexy':
+            axes = [a for a in axes if a in skipped]
         if not axes:
             return None, 'single-motor axes'
         if self.printer.lookup_object('motors_sync', None) is not None:
@@ -925,12 +933,12 @@ class SpeedTest:
                     'StallGuard sync (motor_sync)')
         return None, 'unavailable'
 
-    def _resync_after_skip(self, gcmd):
+    def _resync_after_skip(self, gcmd, skipped=None):
         """A lost step can leave the two motors of a belt out of phase,
         and homing does not fix that. Run the re-sync at the travel
         limits (never the test limits that just caused the skip), then
         force a re-home before the next baseline."""
-        script, how = self._resync_plan()
+        script, how = self._resync_plan(skipped)
         if script is None:
             if how == 'unavailable':
                 gcmd.respond_info(
