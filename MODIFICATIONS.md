@@ -51,7 +51,7 @@ folder is archived. Uninstall removes the folder once it is empty.
 | Change | Stock behaviour | Modified behaviour |
 |---|---|---|
 | `park_x` / `park_y` options | During a single-axis test the other axis stays wherever homing left it (usually an axis end). | The other axis is moved to `park_x` / `park_y` first (while the tested axis is still at home), then the test runs. Keeps the toolhead clear of obstacles near the ends of travel, e.g. front motor towers on AWD printers. |
-| `skip_resync_gcode` option (default `auto`) | After lost steps the test only re-homes. Re-homing does not restore the phase between the two motors of an AWD belt pair, so later steps can run on desynced motors and read low. | After any step that loses steps on a dual-motor axis: accelerometer sync (`SYNC_MOTORS`, MRX8024/motors-sync) if loaded, else StallGuard sync (`MOTOR_SYNC AXIS=…`, this suite's `[motor_sync]`) if enabled, else a console note that the re-sync was skipped and the motors may now be out of sync. Runs at travel speed/accel, then the next step re-homes. Single-motor axes: nothing happens. `none` = off; any other value is run as literal G-code. |
+| `skip_resync_gcode` option (default `auto`) | After lost steps the test only re-homes. Re-homing does not restore the phase between the two motors of an AWD belt pair, so later steps can run on desynced motors and read low. | After any step that loses steps on a dual-motor axis: accelerometer sync (`SYNC_MOTORS`, MRX8024/motors-sync) if loaded, else StallGuard sync (`MOTOR_SYNC AXIS=…`, this suite's `[motor_sync]`) if enabled, else a console note that the re-sync was skipped and the motors may now be out of sync. Runs at travel speed/accel, then the next step re-homes. Single-motor axes: nothing happens. On a cartesian machine only the axes that skipped are re-synced (a skip on single-motor X no longer runs `MOTOR_SYNC AXIS=Y`); on CoreXY every pair is, since both belts move. `none` = off; any other value is run as literal G-code. |
 
 | Z-axis tests (`AXIS=Z`) — **untested on real hardware, use at your own risk** | `AXIS` must be X or Y. | `SPEED_TEST_FIND_MAX_VELOCITY` and `SPEED_TEST_FIND_MAX_ACCEL` accept `AXIS=Z` (never part of the automatic sweeps; other commands refuse Z). The test raises the kinematics' `max_z_velocity` / `max_z_accel` together with `SET_VELOCITY_LIMIT` for its duration and restores them afterwards, keeps X/Y at `park_x`/`park_y` or the bed centre, and never goes below `z_test_min` (default 30 mm). Every step re-homes Z, runs `QUAD_GANTRY_LEVEL` / `Z_TILT_ADJUST`, re-homes again and compares **every** Z motor's step count, so a single slipped corner is caught (it is the one the levelling has to correct). Z defaults: velocity 20–300 mm/s, accel 500–20000 mm/s², accel-test speed 100 mm/s. |
 
@@ -85,7 +85,8 @@ passed.
 - `skip_resync_gcode` (default `auto`, as in the speed test): after a
   measurement that lost steps the dual-motor belts are re-synced before
   the next one, so later candidates are not tested on an out-of-phase
-  pair.
+  pair. On a cartesian machine only the tested axis counts: tuning
+  single-motor X never re-syncs the Y pair.
 - A failed candidate still gets one retry, but the console shows
   `OK on retry (lost N µsteps the first time)` and the CSV records the
   first result (`first_try_lost_usteps`). Stock printed a plain `OK`.
